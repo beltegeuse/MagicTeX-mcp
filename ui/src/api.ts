@@ -14,7 +14,9 @@ export type WsMessage =
   | { type: 'reload'; name?: string }
   | { type: 'compiling' }
   | { type: 'compile-error'; log: string }
-  | { type: 'comments-changed' }
+  // quiet: comments only moved with their passage (a recompile); refresh them
+  // without popping the panel open.
+  | { type: 'comments-changed'; quiet?: boolean }
   // Sent once, as the server shuts down. This tab will never reach that server
   // again — and its contents are now history.
   | { type: 'server-closing' }
@@ -38,6 +40,12 @@ export interface Comment {
   replies?: Reply[];
   created: string;
   resolvedNote?: string;
+  prefix?: string;
+  suffix?: string;
+  /** Its passage is not in the latest PDF; `page` is an estimate. */
+  stale?: boolean;
+  /** What now stands where the quote was ('' = deleted); absent while it is still there. */
+  current?: string;
 }
 
 /**
@@ -101,7 +109,9 @@ export async function fetchComments(): Promise<Comment[]> {
   return r.ok ? r.json() : [];
 }
 
-export async function createComment(input: { page: number; quote: string; rects: CommentRect[]; text: string }): Promise<void> {
+export async function createComment(input: {
+  page: number; quote: string; rects: CommentRect[]; text: string; prefix?: string; suffix?: string;
+}): Promise<void> {
   await writeFetch('/api/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
 }
 

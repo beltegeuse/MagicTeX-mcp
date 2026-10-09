@@ -134,6 +134,13 @@ jobs:
       - name: The save chip tells the truth
         run: node scripts/smoke-save-chip-tells-truth.mjs
 
+      # Addressing a comment rewrites or deletes its passage, usually alongside
+      # pages added before it. The comment must still say where it is, what
+      # replaced the passage, and highlight that — through the real edit, the
+      # watcher's recompile and resolve_comment.
+      - name: Comments follow their passage through being addressed
+        run: node scripts/smoke-comment-tracking.mjs
+
       - name: Save engine assets for next time
         if: steps.assets.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6

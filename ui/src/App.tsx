@@ -93,7 +93,7 @@ export default function App() {
   useEffect(() => { refreshComments(); }, [refreshComments]);
 
   const { status, errorLog, reloadTick, pdfName, compileSeq } = useLive((m) => {
-    if (m.type === 'comments-changed') { refreshComments(); setRightOpen(true); }
+    if (m.type === 'comments-changed') { refreshComments(); if (!m.quiet) setRightOpen(true); }
   });
 
   const jumpToComment = useCallback((c: Comment) => {

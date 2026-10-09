@@ -8,7 +8,7 @@ import '../mathSumPrecise'; // must precede pdfjs — see the file for why
 import * as pdfjs from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { createComment, type Comment } from '../api';
-import { fold, findHead, findInFolded, stripLatex } from '../sync';
+import { fold, findHead, locateOn, CONTEXT_CHARS, stripLatex } from '../sync';
 import { groupLines, columnsFromTextItems } from '../lines';
 
 // Our own worker module: it installs the Math.sumPrecise polyfill into the
@@ -65,7 +65,10 @@ const pageScale = (el: HTMLElement) => parseFloat(el.style.getPropertyValue('--s
 const textSpans = (page: Element) =>
   (Array.from(page.querySelectorAll('.textLayer span')) as HTMLElement[]).filter((s) => !s.firstElementChild);
 
-interface Draft { page: number; quote: string; rects: { x: number; y: number; w: number; h: number }[]; x: number; y: number }
+interface Draft {
+  page: number; quote: string; rects: { x: number; y: number; w: number; h: number }[]; x: number; y: number;
+  prefix: string; suffix: string;
+}
 interface SyncTarget { text: string; nonce: number }
 /** A point on a page (scale-1 units) and the pane position (px) it should sit at. */
 interface Anchor { page: string; ax: number; ay: number; vx: number; vy: number }
@@ -609,17 +612,31 @@ export function PdfView({
     // that same property is what made a two-column page paint across the gutter
     // until the grouping learned about columns. Extracted so the geometry can be
     // unit-tested with synthetic coordinates.
-    const liveBoxes = (page: Element, quote: string): { l: number; t: number; w: number; h: number }[] | null => {
-      const needle = fold(quote).text;
-      if (!needle) return null;
+    const liveBoxes = (page: Element, c: Comment): { l: number; t: number; w: number; h: number; cls?: string }[] | null => {
       const { concat, all, pageBox } = pageText(page);
       // Stored at scale 1 by the renderer; project to what is on screen now.
       const cols: number[] = (() => {
         try { return JSON.parse((page as HTMLElement).dataset.columns ?? '[]') as number[]; } catch { return []; }
       })().map((x) => x * (parseFloat(getComputedStyle(page).getPropertyValue('--scale-factor')) || 1));
-      const match = findInFolded(concat, needle);
+      // The occurrence whose surroundings match the comment's context, so a
+      // word repeated on the page ("Partagée" as frame and block title) lights
+      // up where the comment was made — the one the server placed it by. Once
+      // the passage was rewritten (the comment addressed), it is what now
+      // stands between that context.
+      const match = locateOn(concat, c);
       if (!match) return null;
       const { start: at, end } = match;
+      if (at === end) {
+        // Deleted: a thin caret where the passage was, between the text that
+        // was before it and the text that was after it.
+        const after = all.find((s) => s.start <= at && at < s.start + s.len);
+        const before = all.find((s) => s.start < at && at === s.start + s.len);
+        const host = after ?? before;
+        if (!host) return null;
+        const x = after ? edgeInSpan(after, at - after.start, 'left', pageBox.left) ?? after.l
+          : edgeInSpan(before!, at - 1 - before!.start, 'right', pageBox.left) ?? before!.l + before!.w;
+        return [{ l: x - 1, t: host.t, w: 3, h: host.h, cls: 'hl-caret' }];
+      }
       const hits = (line: { spans: Span[] }) => line.spans.filter((s) => s.start < end && s.start + s.len > at);
 
       // Shape it like a text selection: the first touched line starts at the
@@ -659,20 +676,26 @@ export function PdfView({
         const pageEl = container.querySelector(`.page[data-page="${c.page}"]`);
         const layer = pageEl?.querySelector('.hl-layer');
         if (!layer) continue;
-        const boxes = liveBoxes(pageEl!, c.quote);
+        const boxes = liveBoxes(pageEl!, c);
         // The page's own scale, not the zoom state: during a redraw the pages
         // on screen are still the ones drawn at the previous zoom.
         const ps = pageScale(pageEl as HTMLElement);
-        if (boxes) for (const b of boxes) box(layer, c, statusCls, b.l, b.t, b.w, b.h);
-        else for (const r of c.rects) box(layer, c, statusCls, r.x * ps, r.y * ps, r.w * ps, r.h * ps);
+        if (boxes) for (const b of boxes) box(layer, c, `${statusCls} ${b.cls ?? ''}`, b.l, b.t, b.w, b.h);
+        // Nothing left to find: the frozen boxes, dashed when the passage is
+        // known to be gone — an estimate, not a claim about the text under them.
+        else for (const r of c.rects) box(layer, c, `${statusCls} ${c.stale ? 'hl-stale' : ''}`, r.x * ps, r.y * ps, r.w * ps, r.h * ps);
         continue;
       }
-      // Reviewer/agent comment posted without PDF coords → find the quote anywhere.
-      for (const page of container.querySelectorAll('.page')) {
-        const boxes = liveBoxes(page, c.quote);
+      // Reviewer/agent comment posted without PDF coords, or one the server just
+      // moved to another page → find the quote, starting at the page the server
+      // placed it on and working outwards.
+      const order = Array.from(container.querySelectorAll<HTMLElement>('.page'))
+        .sort((a, b) => Math.abs(Number(a.dataset.page) - c.page) - Math.abs(Number(b.dataset.page) - c.page));
+      for (const page of order) {
+        const boxes = liveBoxes(page, c);
         if (!boxes) continue;
         const layer = page.querySelector('.hl-layer')!;
-        for (const b of boxes) box(layer, c, statusCls, b.l, b.t, b.w, b.h);
+        for (const b of boxes) box(layer, c, `${statusCls} ${b.cls ?? ''}`, b.l, b.t, b.w, b.h);
         break;
       }
     }
@@ -705,13 +728,29 @@ export function PdfView({
     const rawY = last.bottom - scRect.top + scroller.scrollTop + 6;
     const x = Math.max(scroller.scrollLeft + 8, Math.min(rawX, scroller.scrollLeft + scroller.clientWidth - 316));
     const y = Math.min(rawY, scroller.scrollTop + scroller.clientHeight - 40);
-    setDraft({ page: Number(pageEl.dataset.page), quote: quote.slice(0, 600), rects, x, y });
+    // The page text either side of the selection: what tells this passage apart
+    // from the same words elsewhere once pages move (see src/preview/reanchor.ts).
+    let prefix = '', suffix = '';
+    const layer = pageEl.querySelector('.textLayer');
+    if (layer?.contains(range.startContainer) && layer.contains(range.endContainer)) {
+      const before = document.createRange();
+      before.setStart(layer, 0);
+      before.setEnd(range.startContainer, range.startOffset);
+      const after = document.createRange();
+      after.setStart(range.endContainer, range.endOffset);
+      after.setEnd(layer, layer.childNodes.length);
+      prefix = before.toString().slice(-CONTEXT_CHARS);
+      suffix = after.toString().slice(0, CONTEXT_CHARS);
+    }
+    setDraft({ page: Number(pageEl.dataset.page), quote: quote.slice(0, 600), rects, x, y, prefix, suffix });
     setDraftText('');
   };
 
   const submitDraft = async () => {
     if (!draft || !draftText.trim()) return;
-    await createComment({ page: draft.page, quote: draft.quote, rects: draft.rects, text: draftText.trim() });
+    await createComment({
+      page: draft.page, quote: draft.quote, rects: draft.rects, text: draftText.trim(), prefix: draft.prefix, suffix: draft.suffix,
+    });
     setDraft(null);
     window.getSelection()?.removeAllRanges();
   };

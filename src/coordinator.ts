@@ -6,6 +6,7 @@ import { compileProject, type CompileProjectResult, type Engine, type Backend } 
 import { getPreview } from './engine/browserHost.js';
 import { createCheckpoint } from './git/checkpoints.js';
 import { setProjectRoot } from './session.js';
+import { scheduleReanchor, setLatestPdfText } from './preview/pdfPages.js';
 
 interface Config {
   projectRoot: string;
@@ -58,6 +59,14 @@ async function doCompile(): Promise<CompileProjectResult> {
       if (clean) await createCheckpoint(config.projectRoot);
       preview.setLatestPdf(result.pdf, result.mainFile);
       lastPublishWasClean = clean;
+      // Pages may have been added or removed: move each comment to wherever
+      // its quote is now. Only from a clean render — a truncated one would
+      // send comments to the wrong pages and wipe their boxes. Not awaited, so
+      // the next compile doesn't wait on pdf.js; check_comments does instead.
+      if (clean) {
+        setLatestPdfText(result.pdf);
+        scheduleReanchor(config.projectRoot, () => preview.broadcast({ type: 'comments-changed', quiet: true }));
+      }
     }
     if (!clean) {
       preview.broadcast({ type: 'compile-error', log: (result.log || '').slice(-1800) });

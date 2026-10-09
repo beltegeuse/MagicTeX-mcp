@@ -13,7 +13,8 @@ import { SHOW_DIFF_NAME, showDiffConfig } from './tools/showDiffToolDef.js';
 import { LIST_CHECKPOINTS_NAME, listCheckpointsConfig } from './tools/listCheckpointsToolDef.js';
 import { CHECK_COMMENTS_NAME, checkCommentsConfig, RESOLVE_COMMENT_NAME, resolveCommentConfig, ADD_COMMENT_NAME, addCommentConfig, REPLY_COMMENT_NAME, replyCommentConfig } from './tools/commentsToolDefs.js';
 import { listComments, updateComment, addComment, addReply } from './preview/commentsStore.js';
-import { findAnchor } from './preview/anchorMatch.js';
+import { findAnchor, loadSources } from './preview/anchorMatch.js';
+import { latestPageTexts, reanchorToLatest, settleComments } from './preview/pdfPages.js';
 import { getPreview, peekPreview, captureDiff, shutdownEngine } from './engine/browserHost.js';
 import { setConfig, requestCompile } from './coordinator.js';
 import { setProjectRoot } from './session.js';
@@ -190,14 +191,34 @@ server.registerTool(LIST_CHECKPOINTS_NAME, listCheckpointsConfig, async ({ limit
 server.registerTool(CHECK_COMMENTS_NAME, checkCommentsConfig, async ({ includeResolved }) => {
   const projectRoot = process.cwd();
   setProjectRoot(projectRoot);
+  // A compile that just finished may still be moving comments to their new pages.
+  await settleComments();
   const all = await listComments(projectRoot);
   const accepted = all.filter((c) => c.status === 'accepted');
   const resolved = all.filter((c) => c.status === 'resolved');
   const suggested = all.filter((c) => c.status === 'suggested');
   // Each accepted comment becomes a located work item: the quoted passage, the
-  // instruction, and the source file:line it anchors to (best-effort text match).
+  // instruction, and the source file:line it anchors to (best-effort text match,
+  // told apart by the comment's page when the quote appears more than once).
+  const pages = accepted.length ? await latestPageTexts() : null;
+  // The project's sources, read once for every lookup below (up to three per
+  // comment: its quote, what replaced it, the text after a deletion).
+  const sources = accepted.length ? await loadSources(projectRoot) : null;
+  // What became of the passage: rewritten or deleted (usually by addressing the
+  // comment), or gone altogether so that the page is only an estimate.
+  const fate = (c: (typeof all)[number]) =>
+    (c.current === '' ? ' (passage deleted)'
+      : c.current !== undefined ? ` (passage edited, now: "${c.current.slice(0, 120)}${c.current.length > 120 ? '…' : ''}")`
+        : '')
+    + (c.stale ? ' (page estimated — passage not found in the PDF)' : '');
   const fmtLocated = async (c: (typeof all)[number]) => {
-    const anchor = await findAnchor(projectRoot, c.quote);
+    const ctx = { prefix: c.prefix, suffix: c.suffix, pageText: pages?.[c.page - 1] };
+    // The quote, or once it has been rewritten, what replaced it — or, deleted,
+    // the text that followed it.
+    const anchor = !sources ? null
+      : await findAnchor(sources, c.quote, ctx)
+        ?? (c.current ? await findAnchor(sources, c.current, ctx) : null)
+        ?? (c.current === '' && c.suffix ? await findAnchor(sources, c.suffix.slice(0, 48), ctx) : null);
     const loc = anchor
       ? `\n  ↳ source: ${anchor.file}:${anchor.line}`
       : '\n  ↳ source: not located — search the files for the quoted text';
@@ -205,10 +226,10 @@ server.registerTool(CHECK_COMMENTS_NAME, checkCommentsConfig, async ({ includeRe
     const thread = c.replies?.length
       ? '\n  ' + c.replies.map((r) => `↪ ${r.by}: ${r.text}`).join('\n  ')
       : '';
-    return `[id: ${c.id}]${who} p.${c.page} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"${loc}\n  → ${c.text}${thread}`;
+    return `[id: ${c.id}]${who} p.${c.page}${fate(c)} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"${loc}\n  → ${c.text}${thread}`;
   };
   const fmtPlain = (c: (typeof all)[number]) =>
-    `[id: ${c.id}] p.${c.page} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"\n  → ${c.text}`;
+    `[id: ${c.id}] p.${c.page}${fate(c)} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"\n  → ${c.text}`;
   const awaiting = suggested.length
     ? `\n\n(${suggested.length} reviewer suggestion${suggested.length === 1 ? '' : 's'} still ${suggested.length === 1 ? 'awaits' : 'await'} the human's accept in the workspace — not actionable yet.)`
     : '';
@@ -248,6 +269,12 @@ server.registerTool(ADD_COMMENT_NAME, addCommentConfig, async ({ quote, comment,
     text: comment,
     role: role ?? 'reviewer',
     status: accepted ? 'accepted' : 'suggested',
+  });
+  // Put it on the page its quote is actually on (the agent's `page` is a hint,
+  // 1 by default), and give it the context that keeps it there.
+  await settleComments();
+  await reanchorToLatest(projectRoot).catch((e) => {
+    console.error(`[magictex-mcp] re-anchoring comments failed: ${e instanceof Error ? e.message : String(e)}`);
   });
   try { peekPreview()?.broadcast({ type: 'comments-changed' }); } catch { /* no viewer */ }
   const where = accepted

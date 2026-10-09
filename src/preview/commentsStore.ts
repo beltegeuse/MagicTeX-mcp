@@ -1,12 +1,15 @@
 // LiquidText-style anchored comments, stored per-project in
-// .latex-preview/comments.json. The anchor is a page number + the quoted text +
-// its bounding rects at scale 1, so highlights re-project at any zoom. The dir
+// .latex-preview/comments.json. The anchor is the quoted text + a little of the
+// page text around it; the page number and the bounding rects (at scale 1, so
+// highlights re-project at any zoom) are a cache of where that text was last
+// found, refreshed after every compile (see reanchor.ts). The dir
 // is already ignored by the file watcher and the project collector, so comment
 // writes never trigger recompiles or end up in export zips.
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { withLock } from '../lock.js';
+import type { AnchorUpdate } from './reanchor.js';
 
 export interface CommentRect { x: number; y: number; w: number; h: number }
 
@@ -36,6 +39,22 @@ export interface Comment {
   created: string;
   resolvedNote?: string;
   resolvedAt?: string;
+  /** Page text just before / after the quote, to tell repeated passages apart. */
+  prefix?: string;
+  suffix?: string;
+  /**
+   * The passage itself was not found in the latest PDF: `page` is an estimate
+   * (or, with nothing to go on, where it last was).
+   */
+  stale?: boolean;
+  /**
+   * The text that now stands where the quote was — usually because the comment
+   * was addressed. '' when the passage was deleted; absent while the quote is
+   * still there.
+   */
+  current?: string;
+  /** Distinctive phrases of the quote's page, to estimate its page if all else is gone. */
+  pageSig?: string[];
 }
 
 const FILE = 'comments.json';
@@ -103,8 +122,16 @@ export async function listComments(root: string): Promise<Comment[]> {
   for (const c of parsed as Comment[]) {
     if (!c) continue;
     if ((c.status as string) === 'pending') c.status = 'accepted'; // pre-rename files
+    // Everything that reads a comment folds its quote and does arithmetic on its
+    // page; one hand-edited `"quote": null` used to stop re-anchoring for all.
+    if (typeof c.quote !== 'string') c.quote = c.quote == null ? '' : String(c.quote);
+    if (!Number.isInteger(c.page) || c.page < 1) c.page = Math.max(1, Math.floor(Number(c.page)) || 1);
     if (!Array.isArray(c.rects)) c.rects = [];
     if (!Array.isArray(c.replies)) c.replies = [];
+    if (typeof c.prefix !== 'string') delete c.prefix;
+    if (typeof c.suffix !== 'string') delete c.suffix;
+    if (typeof c.current !== 'string') delete c.current;
+    if (!Array.isArray(c.pageSig) || !c.pageSig.every((p) => typeof p === 'string')) delete c.pageSig;
   }
   return parsed as Comment[];
 }
@@ -125,7 +152,10 @@ async function save(root: string, comments: Comment[]): Promise<void> {
 
 export async function addComment(
   root: string,
-  input: { page: number; quote: string; rects: CommentRect[]; text: string; role?: CommentRole; status?: CommentStatus },
+  input: {
+    page: number; quote: string; rects: CommentRect[]; text: string; role?: CommentRole; status?: CommentStatus;
+    prefix?: string; suffix?: string;
+  },
 ): Promise<Comment> {
   const comment: Comment = {
     id: randomBytes(6).toString('hex'),
@@ -142,6 +172,9 @@ export async function addComment(
     replies: [],
     created: new Date().toISOString(),
   };
+  // Context is optional: an agent's comment gets it on its first re-anchoring.
+  if (typeof input.prefix === 'string') comment.prefix = input.prefix.slice(-200);
+  if (typeof input.suffix === 'string') comment.suffix = input.suffix.slice(0, 200);
   // The whole read -> mutate -> write runs as one cross-process critical
   // section, so two agents adding/resolving/replying to comments at the same
   // moment queue instead of one silently overwriting the other's change.
@@ -186,6 +219,45 @@ export async function addReply(
     (c.replies ??= []).push({ by: reply.by, text: String(reply.text).slice(0, 2000), at: new Date().toISOString() });
     await save(root, all);
     return c;
+  });
+}
+
+
+/**
+ * Re-place every comment against a new PDF. `place` returns the fields that
+ * changed for a comment (or null to leave it alone); `stale: false` and
+ * `current: null` clear those fields. Writes only if something actually changed, so a recompile that
+ * moved nothing doesn't touch the file. Resolves to whether it did.
+ */
+export async function reanchorComments(root: string, place: (c: Comment) => AnchorUpdate | null): Promise<boolean> {
+  return withLock(root, async () => {
+    const all = await listComments(root);
+    let changed = false;
+    for (const c of all) {
+      // One comment that can't be placed must not cost every other one its
+      // place: the failure is reported and that comment is left as it was.
+      let u: AnchorUpdate | null;
+      try { u = place(c); } catch (e) {
+        console.error(`[magictex-mcp] could not re-anchor comment ${c.id}: ${e instanceof Error ? e.message : String(e)}`);
+        continue;
+      }
+      if (!u) continue;
+      if (u.page !== undefined && u.page !== c.page) { c.page = u.page; changed = true; }
+      if (u.rects !== undefined && JSON.stringify(u.rects) !== JSON.stringify(c.rects)) { c.rects = u.rects; changed = true; }
+      if (u.prefix !== undefined && u.prefix !== c.prefix) { c.prefix = u.prefix; changed = true; }
+      if (u.suffix !== undefined && u.suffix !== c.suffix) { c.suffix = u.suffix; changed = true; }
+      if (u.stale !== undefined && u.stale !== !!c.stale) {
+        if (u.stale) c.stale = true; else delete c.stale;
+        changed = true;
+      }
+      if (u.current !== undefined && u.current !== (c.current ?? null)) {
+        if (u.current === null) delete c.current; else c.current = u.current;
+        changed = true;
+      }
+      if (u.pageSig !== undefined && JSON.stringify(u.pageSig) !== JSON.stringify(c.pageSig)) { c.pageSig = u.pageSig; changed = true; }
+    }
+    if (changed) await save(root, all);
+    return changed;
   });
 }
 

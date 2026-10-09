@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { findAnchor } from '../src/preview/anchorMatch.js';
+import { findAnchor, loadSources } from '../src/preview/anchorMatch.js';
 
 const project = (main: string) => {
   const d = mkdtempSync(join(tmpdir(), 'am-'));
@@ -55,5 +55,44 @@ test('locates a quote that crosses a hard-wrapped line or a hyphenated word', as
     const b = await findAnchor(d, 'variance with no high-\nlighting bias');
     assert.ok(b);
     assert.equal(b!.line, 4);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('a short quote found in several files is told apart by its page', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'am-'));
+  try {
+    writeFileSync(join(d, 'main.tex'), '\\documentclass{beamer}\n\\begin{document}\n\\input{boucles}\n\\input{portee}\n\\end{document}\n');
+    writeFileSync(join(d, 'boucles.tex'), '\\begin{frame}{Boucles}\n\\myemph{Réécrite, puis partagée}\nUn indice entier.\n\\end{frame}\n');
+    writeFileSync(join(d, 'portee.tex'), [
+      '\\begin{frame}{Portée des variables : privée ou partagée}',
+      '\\begin{block}{Privée}',
+      '\\item Une \\myemph{copie par thread}',
+      '\\end{block}',
+      '\\begin{block}{Partagée}',
+      '\\item Une seule variable, vue de \\myemph{tous}',
+      '\\end{block}',
+      '\\end{frame}',
+    ].join('\n'));
+    // Without context: whichever file comes first.
+    assert.equal((await findAnchor(d, 'Partagée'))!.file, 'boucles.tex');
+    // With the page it is on: the scope slide.
+    const pageText = 'Portée des variables : privée ou partagéePrivéeUne copie par threadPartagéeUne seule variable, vue de tous';
+    const onPage = await findAnchor(d, 'Partagée', { pageText });
+    assert.equal(onPage!.file, 'portee.tex');
+    // And the prefix/suffix pick the block title, not the frame title.
+    const exact = await findAnchor(d, 'Partagée', { pageText, prefix: 'Une copie par thread', suffix: 'Une seule variable' });
+    assert.deepEqual([exact!.file, exact!.line], ['portee.tex', 5]);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('sources read once answer any number of lookups, the same as reading each time', async () => {
+  const d = project('\\documentclass{article}\n\\begin{document}\nThe quick brown fox jumps over the lazy dog here.\nA second sentence about something else entirely.\n\\end{document}\n');
+  try {
+    const sources = await loadSources(d);
+    assert.ok(sources);
+    for (const q of ['quick brown fox jumps over the lazy dog', 'second sentence about something else']) {
+      assert.deepEqual(await findAnchor(sources!, q), await findAnchor(d, q));
+    }
+    assert.equal((await findAnchor(sources!, 'second sentence about something else'))!.line, 4);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });

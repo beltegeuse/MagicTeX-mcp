@@ -186,6 +186,62 @@ export function locateAcross<K>(sources: Iterable<[K, FoldedSource]>, quote: str
   return best && { key: best.key, line: best.line };
 }
 
+/** One place `quote` may start in a source: the file, its 0-based line, and the folded offset. */
+export interface SourceHit<K> { key: K; line: number; at: number }
+
+/**
+ * Every place `quote` may start across several files, for a caller that can
+ * tell them apart (anchorMatch.ts, with the comment's page context). Same
+ * search as locateAcross, but a short quote such as "Partagée" no longer means
+ * "whichever file came first": all hits of the longest head found are returned.
+ */
+export function locateAllAcross<K>(sources: Iterable<[K, FoldedSource]>, quote: string): SourceHit<K>[] {
+  const needle = fold(quote).text;
+  if (needle.length < 4) return [];
+  const all = [...sources];
+  for (const min of [PHRASE_LENGTHS[0], 20]) {
+    for (const n of headLengths(needle, min)) {
+      const head = needle.slice(0, n);
+      const hits: SourceHit<K>[] = [];
+      for (const [key, src] of all) {
+        for (let at = src.text.indexOf(head); at >= 0; at = src.text.indexOf(head, at + 1)) {
+          hits.push({ key, line: lineAt(src, at), at });
+        }
+      }
+      if (hits.length) return hits;
+    }
+  }
+  const one = locateAcross(all, quote);
+  if (!one) return [];
+  const src = all.find(([k]) => k === one.key)![1];
+  return [{ key: one.key, line: one.line, at: src.lineStart[one.line] }];
+}
+
+/** How many characters `a` and `b` share at their ends. */
+export function commonSuffixLength(a: string, b: string): number {
+  let n = 0;
+  while (n < a.length && n < b.length && a[a.length - 1 - n] === b[b.length - 1 - n]) n++;
+  return n;
+}
+
+/** How many characters `a` and `b` share at their starts. */
+export function commonPrefixLength(a: string, b: string): number {
+  let n = 0;
+  while (n < a.length && n < b.length && a[n] === b[n]) n++;
+  return n;
+}
+
+/**
+ * How well the text around [start, end) of folded `text` matches a remembered
+ * folded context: letters shared, outwards, with `pre` before and `post` after.
+ * The one formula both the PDF side (reanchor.ts) and the source side
+ * (anchorMatch.ts) tell repeated passages apart by.
+ */
+export function contextScore(text: string, start: number, end: number, pre: string, post: string): number {
+  return commonSuffixLength(pre, text.slice(Math.max(0, start - pre.length), start))
+    + commonPrefixLength(post, text.slice(end, end + post.length));
+}
+
 /** The 0-based line of `content` (a LaTeX file) where `quote` starts, or null. */
 export function locateInSource(content: string, quote: string): number | null {
   return locateAcross([[null, foldSource(content)]], quote)?.line ?? null;
