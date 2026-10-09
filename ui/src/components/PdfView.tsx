@@ -49,9 +49,30 @@ try {
 
 const MIN_SCALE = 0.4;
 const MAX_SCALE = 3;
+// Ctrl+wheel: one mouse-wheel notch (deltaY 100) zooms by about 16%; a
+// trackpad pinch sends many small deltas and so zooms smoothly.
+const WHEEL_ZOOM_RATE = 0.0015;
+// Firefox reports a notch in lines (3 of them) rather than pixels; a third of a
+// Chrome notch per line makes the two browsers zoom alike.
+const WHEEL_LINE_PX = 100 / 3;
+// How long a wheel gesture must pause before the pages are redrawn at its scale.
+const WHEEL_SETTLE_MS = 150;
+
+/** The scale a `.page` was drawn at, as the renderer recorded it on the page. */
+const pageScale = (el: HTMLElement) => parseFloat(el.style.getPropertyValue('--scale-factor')) || 1;
 
 interface Draft { page: number; quote: string; rects: { x: number; y: number; w: number; h: number }[]; x: number; y: number }
 interface SyncTarget { text: string; nonce: number }
+/** A point on a page (scale-1 units) and the pane position (px) it should sit at. */
+interface Anchor { page: string; ax: number; ay: number; vx: number; vy: number }
+/**
+ * A Ctrl+wheel / pinch zoom in progress: the pane position it is anchored at,
+ * the scale it is heading for, and the preview stretch currently applied —
+ * `scale(k)` about `origin`, in `.pdf-pages` coordinates; origin null = none yet.
+ */
+interface Gesture { vx: number; vy: number; pending: number; origin: { x: number; y: number } | null; k: number }
+/** Safari's pinch event (non-standard, so not in lib.dom). */
+interface SafariGestureEvent extends UIEvent { scale: number; clientX: number; clientY: number }
 
 export function PdfView({
   reloadTick, comments, onPages, onSelectComment, onSyncToSource, syncTarget,
@@ -73,34 +94,138 @@ export function PdfView({
   const [draft, setDraft] = useState<Draft | null>(null);
   const [draftText, setDraftText] = useState('');
   const [scale, setScale] = useState(1.5);
+  // The scale a Ctrl+wheel / pinch gesture is heading for, before it is
+  // committed. The label shows it at once; the pages follow when it settles.
+  const [preview, setPreview] = useState<number | null>(null);
   const [numPages, setNumPages] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
   const baseWidth = useRef(0); // page-1 width at scale 1, for fit-to-width
   const scaleRef = useRef(scale);
   scaleRef.current = scale;
+  // The parsed PDF is kept between renders, so a zoom redraws from memory.
+  // Zoom used to re-download /latest.pdf on every step: a window whose server
+  // had stopped — its Claude session ended — kept its old pages while the %
+  // label moved, which read as "zoom does nothing".
+  const docRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
+  const [docTick, setDocTick] = useState(0); // bumps when docRef holds a new document
+  const renderedScale = useRef(0); // the scale of the pages currently in the DOM
+  // Column boundaries per page, as stored on `.page`. They are in scale-1 units,
+  // so they hold for every zoom of a document; recomputing them made each zoom
+  // fetch every page's text content a second time.
+  const columnsCache = useRef<{ doc: pdfjs.PDFDocumentProxy | null; byPage: Map<number, string> }>({ doc: null, byPage: new Map() });
+  const gestureRef = useRef<Gesture | null>(null);
 
-  // ── Render PDF pages (canvas + text layer) ──────────────────────────────
+  // A failure report someone can screenshot. A screenshot is what actually
+  // reaches a maintainer, so it has to carry enough on its own — which step,
+  // which browser, which pdf.js. The console gets the error object itself, so
+  // DevTools can offer a real clickable stack.
+  const reportFailure = (step: string, e: unknown) => {
+    console.error('[MagicTeX] PDF render failed during: ' + step, e);
+    const err = e as { message?: string; stack?: string; name?: string };
+    // pdf.js re-creates worker exceptions on this side of a postMessage, and a
+    // stack does not survive that trip — so for the errors most worth
+    // diagnosing there is nothing to print. Say so, rather than leaving a gap
+    // that reads like the report simply forgot: "no stack" is itself the clue
+    // that the failure happened inside the worker, not in this file.
+    const stack = err?.stack
+      ? '\n' + err.stack.split('\n').slice(0, 6).join('\n')
+      : '\n(no stack — the error crossed the pdf.js worker boundary, which does not carry one)';
+    setNoteIsReport(true);
+    setNote(
+      `render failed while ${step}\n\n${err?.name ?? 'Error'}: ${err?.message ?? String(e)}${stack}` +
+      `\n\npdf.js ${pdfjs.version} · ${navigator.userAgent}`,
+    );
+  };
+
+  // The point of the pages under a pane position (px from the pane's corner),
+  // as an anchor. Measured in layout (offsets), with the preview stretch undone:
+  // a point seen at V under scale(k) about O sits at O + (V − O) / k.
+  const captureAnchor = (vx: number, vy: number): Anchor | null => {
+    const scroller = scrollRef.current;
+    const pages = pagesRef.current;
+    const s = renderedScale.current;
+    if (!scroller || !pages || !s) return null;
+    let px = scroller.scrollLeft + vx - pages.offsetLeft;
+    let py = scroller.scrollTop + vy - pages.offsetTop;
+    const g = gestureRef.current;
+    if (g?.origin && g.k !== 1) {
+      px = g.origin.x + (px - g.origin.x) / g.k;
+      py = g.origin.y + (py - g.origin.y) / g.k;
+    }
+    const x = px + pages.offsetLeft;
+    const y = py + pages.offsetTop;
+    let hit: HTMLElement | null = null;
+    for (const el of pagesRef.current?.querySelectorAll<HTMLElement>('.page') ?? []) {
+      if (!hit || el.offsetTop <= y) hit = el;
+      else break;
+    }
+    if (!hit) return null;
+    return { page: hit.dataset.page ?? '1', ax: (x - hit.offsetLeft) / s, ay: (y - hit.offsetTop) / s, vx, vy };
+  };
+  const restoreAnchor = (a: Anchor, s: number) => {
+    const scroller = scrollRef.current;
+    const el = pagesRef.current?.querySelector<HTMLElement>(`.page[data-page="${a.page}"]`);
+    if (!scroller || !el) return;
+    scroller.scrollLeft = el.offsetLeft + a.ax * s - a.vx;
+    scroller.scrollTop = el.offsetTop + a.ay * s - a.vy;
+  };
+  // Stretch the pages already on screen towards the gesture's scale, around
+  // the point under its anchor, until the real redraw lands. The origin is
+  // fixed when the stretch starts: recomputing it from the scroll position on
+  // every event moved the zoom point whenever that position changed under it.
+  const applyPreview = (g: Gesture) => {
+    const scroller = scrollRef.current;
+    const pages = pagesRef.current;
+    if (!scroller || !pages || !renderedScale.current) return;
+    g.origin ??= { x: scroller.scrollLeft + g.vx - pages.offsetLeft, y: scroller.scrollTop + g.vy - pages.offsetTop };
+    g.k = g.pending / renderedScale.current;
+    pages.style.transformOrigin = `${g.origin.x}px ${g.origin.y}px`;
+    pages.style.transform = `scale(${g.k})`;
+  };
+  const clearPreview = () => {
+    const pages = pagesRef.current;
+    if (pages) { pages.style.transform = ''; pages.style.transformOrigin = ''; }
+    setPreview(null);
+  };
+
+  // ── Load /latest.pdf (on every reload) ─────────────────────────────────
   useEffect(() => {
     let cancelled = false;
-    // What the render was doing when it threw. A rendering failure reported as
+    // What the load was doing when it threw. A rendering failure reported as
     // bare `String(e)` cost three rounds of guessing on a real bug: the message
     // "TypeError: undefined is not a function (near '...e of t...')" named no
     // page, no step and no stack, so every reading of it was a guess. Whatever
     // fails next should say where.
-    let step = 'starting';
+    let step = 'fetching /latest.pdf';
     (async () => {
-      const container = pagesRef.current;
-      const scroller = scrollRef.current;
-      if (!container || !scroller) return;
-      step = 'fetching /latest.pdf';
       const res = await fetch('/latest.pdf?t=' + Date.now());
       if (!res.ok) { setNoteIsReport(false); setNote('No PDF yet — ask Claude to render a preview.'); return; }
       const data = new Uint8Array(await res.arrayBuffer());
       step = `parsing PDF (${data.length} bytes)`;
       const doc = await pdfjs.getDocument({ data }).promise;
       if (cancelled) return;
-      // Preserve scroll position as a ratio so zoom keeps you in place.
-      const ratio = scroller.scrollHeight ? scroller.scrollTop / scroller.scrollHeight : 0;
+      docRef.current = doc;
+      setDocTick((t) => t + 1);
+    })().catch((e) => {
+      if (cancelled) { console.warn('[MagicTeX] superseded load failed during: ' + step, e); return; }
+      reportFailure(step, e);
+    });
+    return () => { cancelled = true; };
+  }, [reloadTick]);
+
+  // ── Render PDF pages (canvas + text layer) ──────────────────────────────
+  useEffect(() => {
+    const doc = docRef.current;
+    if (!doc) return;
+    let cancelled = false;
+    let step = 'starting';
+    const renderScale = scaleRef.current;
+    (async () => {
+      const container = pagesRef.current;
+      const scroller = scrollRef.current;
+      if (!container || !scroller) return;
+      if (columnsCache.current.doc !== doc) columnsCache.current = { doc, byPage: new Map() };
+      const columns = columnsCache.current.byPage;
       // Render every page off-screen, then swap in at once — no blank flash.
       const next = document.createDocumentFragment();
       for (let i = 1; i <= doc.numPages; i++) {
@@ -108,13 +233,13 @@ export function PdfView({
         const pg = await doc.getPage(i);
         if (cancelled) return;
         if (i === 1) baseWidth.current = pg.getViewport({ scale: 1 }).width;
-        const vp = pg.getViewport({ scale: scaleRef.current });
+        const vp = pg.getViewport({ scale: renderScale });
         const wrap = document.createElement('div');
         wrap.className = 'page';
         wrap.dataset.page = String(i);
         wrap.style.width = `${vp.width}px`;
         wrap.style.height = `${vp.height}px`;
-        wrap.style.setProperty('--scale-factor', String(scaleRef.current));
+        wrap.style.setProperty('--scale-factor', String(renderScale));
         const canvas = document.createElement('canvas');
         canvas.width = vp.width;
         canvas.height = vp.height;
@@ -153,21 +278,46 @@ export function PdfView({
         // report any more, but the warning below is the only trace a skipped page
         // leaves, and "which page, at which stage" is the part worth having in it.
         step = `page ${i}/${doc.numPages}: column detection`;
-        try {
-          const content = await pg.getTextContent();
-          const cols = columnsFromTextItems(content.items, pg.getViewport({ scale: 1 }).height);
-          wrap.dataset.columns = JSON.stringify(cols);
-        } catch (e) {
-          console.warn(`[magictex] column detection skipped — ${step}`, e);
+        const known = columns.get(i);
+        if (known !== undefined) wrap.dataset.columns = known;
+        else {
+          try {
+            const content = await pg.getTextContent();
+            const cols = JSON.stringify(columnsFromTextItems(content.items, pg.getViewport({ scale: 1 }).height));
+            wrap.dataset.columns = cols;
+            columns.set(i, cols);
+          } catch (e) {
+            console.warn(`[magictex] column detection skipped — ${step}`, e);
+          }
         }
       }
       if (cancelled) return;
+      // Where to put the view, read off the old pages at the last moment, so a
+      // scroll made while this was drawing is kept rather than undone. A zoom
+      // keeps the point under the gesture's cursor (or the pane's middle, for
+      // the buttons) still; a reload at the same scale keeps the scroll ratio.
+      const g = gestureRef.current;
+      const zoomed = !!renderedScale.current && renderedScale.current !== renderScale;
+      const anchor = g ? captureAnchor(g.vx, g.vy)
+        : zoomed ? captureAnchor(scroller.clientWidth / 2, scroller.clientHeight / 2) : null;
+      const ratio = scroller.scrollHeight ? scroller.scrollTop / scroller.scrollHeight : 0;
       container.replaceChildren(next);
+      renderedScale.current = renderScale;
+      container.style.transform = '';
+      container.style.transformOrigin = '';
       setNote('');
       setNumPages(doc.numPages);
       onPages?.(doc.numPages);
       setRenderTick((t) => t + 1);
-      scroller.scrollTop = ratio * scroller.scrollHeight;
+      if (anchor) restoreAnchor(anchor, renderScale);
+      else scroller.scrollTop = ratio * scroller.scrollHeight;
+      if (g) {
+        // The gesture went on while this redraw was running: keep previewing
+        // what it is heading for, stretched from the new pages. Its own commit
+        // follows. (Highlights are measured with the stretch taken off.)
+        if (Math.abs(g.pending - renderScale) > 1e-3) { g.origin = null; applyPreview(g); }
+        else { gestureRef.current = null; setPreview(null); }
+      }
     })().catch((e) => {
       // A superseded run must not speak. Every other exit in this effect is gated
       // on `cancelled`; the catch was not, so a run abandoned by a zoom click or
@@ -175,28 +325,88 @@ export function PdfView({
       // full failure report over it — styled, deliberately, to be screenshotted
       // into a bug report. The reporting work manufacturing false reports.
       if (cancelled) { console.warn('[MagicTeX] superseded render failed during: ' + step, e); return; }
-      // The console gets the error object itself, so DevTools can offer a real
-      // clickable stack; the pane gets a report someone can screenshot. A
-      // screenshot is what actually reaches a maintainer, so it has to carry
-      // enough on its own — which step, which browser, which pdf.js.
-      console.error('[MagicTeX] PDF render failed during: ' + step, e);
-      const err = e as { message?: string; stack?: string; name?: string };
-      // pdf.js re-creates worker exceptions on this side of a postMessage, and a
-      // stack does not survive that trip — so for the errors most worth
-      // diagnosing there is nothing to print. Say so, rather than leaving a gap
-      // that reads like the report simply forgot: "no stack" is itself the clue
-      // that the failure happened inside the worker, not in this file.
-      const stack = err?.stack
-        ? '\n' + err.stack.split('\n').slice(0, 6).join('\n')
-        : '\n(no stack — the error crossed the pdf.js worker boundary, which does not carry one)';
-      setNoteIsReport(true);
-      setNote(
-        `render failed while ${step}\n\n${err?.name ?? 'Error'}: ${err?.message ?? String(e)}${stack}` +
-        `\n\npdf.js ${pdfjs.version} · ${navigator.userAgent}`,
-      );
+      // The old pages stay up; a zoom preview stretched over them must not.
+      gestureRef.current = null;
+      clearPreview();
+      reportFailure(step, e);
     });
     return () => { cancelled = true; };
-  }, [reloadTick, scale, onPages]);
+  }, [docTick, scale, onPages]);
+
+  // ── Ctrl+wheel / trackpad pinch zooms the PDF, not the browser ──────────
+  // Native listeners because React registers wheel handlers as passive, and a
+  // passive listener cannot stop the browser zooming the whole workspace.
+  // Chrome, Edge and Firefox report a trackpad pinch as a wheel event with
+  // ctrlKey set; Safari sends its own gesture events instead.
+  useEffect(() => {
+    const scroller = scrollRef.current;
+    if (!scroller) return;
+    let timer = 0;
+    const begin = (clientX: number, clientY: number): Gesture | null => {
+      if (!renderedScale.current) return null;
+      if (gestureRef.current) return gestureRef.current;
+      const r = scroller.getBoundingClientRect();
+      return (gestureRef.current = { vx: clientX - r.left, vy: clientY - r.top, pending: scaleRef.current, origin: null, k: 1 });
+    };
+    const update = (g: Gesture, next: number) => {
+      g.pending = Math.min(MAX_SCALE, Math.max(MIN_SCALE, next));
+      setPreview(g.pending);
+      applyPreview(g);
+    };
+    // Redrawing every page per wheel tick would never keep up: commit once
+    // the gesture pauses, and let the preview carry it until then.
+    const commit = () => {
+      const cur = gestureRef.current;
+      if (!cur) return;
+      const target = +cur.pending.toFixed(3);
+      if (Math.abs(target - scaleRef.current) < 1e-3) {
+        // Back where it started (or pinned at a limit): nothing to redraw.
+        if (Math.abs(target - renderedScale.current) < 1e-3) { gestureRef.current = null; clearPreview(); }
+        return;
+      }
+      setScale(target);
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const g = begin(e.clientX, e.clientY);
+      if (!g) return;
+      const dy = e.deltaMode === 1 ? e.deltaY * WHEEL_LINE_PX : e.deltaMode === 2 ? e.deltaY * scroller.clientHeight : e.deltaY;
+      update(g, g.pending * Math.exp(-dy * WHEEL_ZOOM_RATE));
+      clearTimeout(timer);
+      timer = window.setTimeout(commit, WHEEL_SETTLE_MS);
+    };
+    // Safari: `scale` is relative to where the pinch began, so keep that base.
+    let pinchBase = 0;
+    const onGestureStart = (e: Event) => {
+      e.preventDefault();
+      const ge = e as SafariGestureEvent;
+      pinchBase = begin(ge.clientX, ge.clientY)?.pending ?? 0;
+      clearTimeout(timer);
+    };
+    const onGestureChange = (e: Event) => {
+      e.preventDefault();
+      const g = gestureRef.current;
+      if (g && pinchBase) update(g, pinchBase * (e as SafariGestureEvent).scale);
+    };
+    const onGestureEnd = (e: Event) => {
+      e.preventDefault();
+      pinchBase = 0;
+      clearTimeout(timer);
+      commit();
+    };
+    scroller.addEventListener('wheel', onWheel, { passive: false });
+    scroller.addEventListener('gesturestart', onGestureStart, { passive: false });
+    scroller.addEventListener('gesturechange', onGestureChange, { passive: false });
+    scroller.addEventListener('gestureend', onGestureEnd, { passive: false });
+    return () => {
+      scroller.removeEventListener('wheel', onWheel);
+      scroller.removeEventListener('gesturestart', onGestureStart);
+      scroller.removeEventListener('gesturechange', onGestureChange);
+      scroller.removeEventListener('gestureend', onGestureEnd);
+      clearTimeout(timer);
+    };
+  }, []);
 
   // ── Track which page is in view (for the page indicator) ────────────────
   useEffect(() => {
@@ -219,11 +429,16 @@ export function PdfView({
     return () => { scroller.removeEventListener('scroll', onScroll); cancelAnimationFrame(raf); };
   }, [renderTick]);
 
-  const zoomBy = (f: number) => setScale((s) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, +(s * f).toFixed(3))));
+  // Button zooms keep the middle of the pane still (see the render's anchor).
+  const zoomTo = (s: number) => {
+    const target = Math.min(MAX_SCALE, Math.max(MIN_SCALE, +s.toFixed(3)));
+    if (target !== scaleRef.current) setScale(target);
+  };
+  const zoomBy = (f: number) => zoomTo(scaleRef.current * f);
   const fitWidth = () => {
     const scroller = scrollRef.current;
     if (!scroller || !baseWidth.current) return;
-    setScale(Math.min(MAX_SCALE, Math.max(MIN_SCALE, +((scroller.clientWidth - 40) / baseWidth.current).toFixed(3))));
+    zoomTo((scroller.clientWidth - 40) / baseWidth.current);
   };
   const goToPage = (n: number) => {
     const p = Math.min(Math.max(1, n), numPages || 1);
@@ -275,6 +490,16 @@ export function PdfView({
   useEffect(() => {
     const container = pagesRef.current;
     if (!container) return;
+    // Everything below measures client rects, which a zoom preview's stretch
+    // would scale — and the boxes then go into layers that are stretched too,
+    // so they came out scaled twice. Measure unstretched; put the stretch back
+    // before the browser paints, so nothing visibly changes.
+    const stretch = container.style.transform;
+    container.style.transform = '';
+    try { projectHighlights(container); } finally { container.style.transform = stretch; }
+  }, [comments, renderTick, onSelectComment]);
+
+  const projectHighlights = (container: HTMLElement) => {
     for (const layer of container.querySelectorAll('.hl-layer')) layer.innerHTML = '';
 
     const box = (layer: Element, c: Comment, statusCls: string, left: number, top: number, w: number, h: number) => {
@@ -429,8 +654,11 @@ export function PdfView({
         const layer = pageEl?.querySelector('.hl-layer');
         if (!layer) continue;
         const boxes = liveBoxes(pageEl!, c.quote);
+        // The page's own scale, not the zoom state: during a redraw the pages
+        // on screen are still the ones drawn at the previous zoom.
+        const ps = pageScale(pageEl as HTMLElement);
         if (boxes) for (const b of boxes) box(layer, c, statusCls, b.l, b.t, b.w, b.h);
-        else for (const r of c.rects) box(layer, c, statusCls, r.x * scale, r.y * scale, r.w * scale, r.h * scale);
+        else for (const r of c.rects) box(layer, c, statusCls, r.x * ps, r.y * ps, r.w * ps, r.h * ps);
         continue;
       }
       // Reviewer/agent comment posted without PDF coords → find the quote anywhere.
@@ -442,7 +670,7 @@ export function PdfView({
         break;
       }
     }
-  }, [comments, renderTick, scale, onSelectComment]);
+  };
 
   // ── Selection → comment composer ────────────────────────────────────────
   const onMouseUp = () => {
@@ -454,11 +682,15 @@ export function PdfView({
     const pageEl = (range.startContainer.parentElement as HTMLElement | null)?.closest('.page') as HTMLElement | null;
     if (!pageEl || !scrollRef.current) return;
     const pageRect = pageEl.getBoundingClientRect();
+    // Stored at scale 1, so divide by the scale the page is SHOWN at: the one it
+    // was drawn at (a redraw at a new zoom may still be running) times any
+    // zoom-preview stretch. Dividing by the zoom state was wrong in both cases.
+    const shown = pageScale(pageEl) * (pageRect.width / (parseFloat(pageEl.style.width) || pageRect.width));
     const rects = Array.from(range.getClientRects())
       .filter((r) => r.width > 1 && r.height > 1)
       .filter((r) => r.left >= pageRect.left - 2 && r.right <= pageRect.right + 2 && r.top >= pageRect.top - 2 && r.bottom <= pageRect.bottom + 2)
       .slice(0, 40)
-      .map((r) => ({ x: (r.left - pageRect.left) / scale, y: (r.top - pageRect.top) / scale, w: r.width / scale, h: r.height / scale }));
+      .map((r) => ({ x: (r.left - pageRect.left) / shown, y: (r.top - pageRect.top) / shown, w: r.width / shown, h: r.height / shown }));
     if (!rects.length) return;
     const scroller = scrollRef.current;
     const scRect = scroller.getBoundingClientRect();
@@ -478,7 +710,7 @@ export function PdfView({
     window.getSelection()?.removeAllRanges();
   };
 
-  const pct = Math.round(scale * 100);
+  const pct = Math.round((preview ?? scale) * 100);
 
   return (
     <div className="pdf-wrap">

@@ -101,8 +101,11 @@ body.resizing .pdf-scroll, body.resizing .editor-scroll { pointer-events: none; 
   font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   user-select: text; max-width: 100%; overflow-x: auto;
 }
-.pdf-pages { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 14px; }
-.page { position: relative; background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,.5); }
+/* Centred by auto margins, not align-items: a page wider than the pane (zoomed
+   in) then starts at the left edge instead of overflowing past it, where no
+   scrollbar reaches. */
+.pdf-pages { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; padding: 14px; }
+.page { position: relative; margin-inline: auto; background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,.5); }
 .page canvas { display: block; }
 
 /* pdf.js text layer: invisible glyphs positioned over the canvas so text is

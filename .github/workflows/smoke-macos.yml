@@ -84,6 +84,19 @@ jobs:
       - name: Highlights stay on their words at every zoom
         run: node scripts/smoke-highlight-zoom.mjs
 
+      # The % label moving while the pages stay put reads as "zoom is broken".
+      # It did, three ways: zoom re-downloaded the PDF (dead once the server
+      # stopped), Ctrl+wheel zoomed the browser instead, and a page wider than
+      # the pane could not be scrolled to its left edge.
+      - name: Zoom resizes the pages — toolbar, Ctrl+wheel, after shutdown
+        run: node scripts/smoke-zoom.mjs
+
+      # With MAGICTEX_PORT pinned, a tab whose server crashed reconnects to the
+      # next server on that port — possibly another project's — and its autosave
+      # wrote into that project's file. Measured before the fix: it did.
+      - name: A stale tab never writes into the next server on its port
+        run: node scripts/smoke-stale-tab.mjs
+
       # A rendering failure nobody can reproduce is only as debuggable as the
       # message the reporter can screenshot. One that named no step, no page and
       # no stack produced three wrong root causes in a row.

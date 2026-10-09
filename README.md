@@ -127,6 +127,13 @@ re-download them, and a checkout, a global install and an `npx` run share one co
 Set `MAGICTEX_ASSETS_DIR` to put them elsewhere. To pre-fetch:
 `npx texlyre-busytex download-assets <that directory>`.
 
+Each server picks a free port for its workspace, so sessions in different projects
+never clash. Set `MAGICTEX_PORT` to pin one instead — e.g. for a development checkout, so
+its URL is recognisable and the workspace's own settings (panel widths, Live, Visual)
+persist; refresh the tab after a restart. If that port is taken, the server falls back to
+a free one and logs which. A window left open from an earlier server never writes into a
+newer one on the same port.
+
 ## Install as a Claude Code plugin (slash commands)
 
 For a low-typing workflow, install MagicTeX as a plugin — one install gives you the
