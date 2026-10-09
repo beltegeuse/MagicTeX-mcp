@@ -9,6 +9,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { withLock } from '../lock.js';
+import type { AnchorUpdate } from './reanchor.js';
 
 export interface CommentRect { x: number; y: number; w: number; h: number }
 
@@ -204,8 +205,6 @@ export async function addReply(
   });
 }
 
-/** Where a comment now is, as reanchorComments' callback reports it. */
-export type AnchorUpdate = Partial<Pick<Comment, 'page' | 'rects' | 'prefix' | 'suffix' | 'stale'>>;
 
 /**
  * Re-place every comment against a new PDF. `place` returns the fields that

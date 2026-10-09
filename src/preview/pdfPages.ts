@@ -1,12 +1,11 @@
 // The text of each page of the PDF on screen, and keeping comments on it.
 //
-// The coordinator hands every published PDF to setLatestPdfText; the text is
+// The coordinator hands every clean PDF to setLatestPdfText; the text is
 // extracted lazily (pdf.js, ~4 ms a page) and only when something asks — the
-// re-anchoring after a compile, which does so only when there are comments,
+// re-anchoring after a compile, which does so only when a comment is open,
 // and check_comments, to tell a comment's source location apart by its page.
-import { listComments, reanchorComments, type AnchorUpdate } from './commentsStore.js';
-import { fold } from './textMatch.js';
-import { contextAt, foldPages, placeQuote } from './reanchor.js';
+import { listComments, reanchorComments, type Comment } from './commentsStore.js';
+import { anchorUpdate, foldPages } from './reanchor.js';
 
 let latest: { pdf: Uint8Array; pages?: Promise<string[] | null> } | null = null;
 
@@ -42,26 +41,36 @@ export function latestPageTexts(): Promise<string[] | null> {
   return latest.pages;
 }
 
+/** Whether a comment is still open (re-anchoring leaves resolved ones be). */
+const isOpen = (c: Comment) => c.status !== 'resolved';
+
 /**
- * Move every comment to the page its quote is on now. Resolves to whether any
- * comment changed, so the caller knows to tell the workspace.
+ * Move every open comment to the page its quote is on now. Resolves to whether
+ * any comment changed, so the caller knows to tell the workspace.
  */
 export async function reanchorToLatest(root: string): Promise<boolean> {
-  if (!(await listComments(root)).length) return false;
+  // A cheap read first: with no open comment, the PDF is never parsed.
+  if (!(await listComments(root)).some(isOpen)) return false;
   const pages = await latestPageTexts();
-  if (!pages?.length) return false;
+  if (!pages) return false;
   const folded = foldPages(pages);
-  return reanchorComments(root, (c): AnchorUpdate | null => {
-    const p = placeQuote(folded, c);
-    if (!p) return fold(c.quote).text.length < 4 ? null : { stale: true };
-    const u: AnchorUpdate = { page: p.page, stale: false };
-    // The stored boxes belong to the old page; the workspace re-finds the text.
-    if (p.page !== c.page) u.rects = [];
-    // A comment without context gets it once its page is certain: it did not
-    // move, or it never had a position of its own (an agent's comment).
-    if (c.prefix === undefined && c.suffix === undefined && (p.page === c.page || !c.rects.length)) {
-      Object.assign(u, contextAt(pages[p.page - 1], p));
-    }
-    return u;
-  });
+  // No extractable text (Type3 bitmap fonts, fonts without a ToUnicode map):
+  // that says nothing about where any passage went.
+  if (!folded.some((t) => t.length)) return false;
+  return reanchorComments(root, (c) => (isOpen(c) ? anchorUpdate(folded, pages, c) : null));
+}
+
+// Re-anchorings run one at a time, off the compile chain: a compile publishes
+// its PDF without waiting for pdf.js to read every page, and readers of the
+// comments wait for the latest pass instead (settleComments).
+let pending: Promise<unknown> = Promise.resolve();
+
+/** Queue a re-anchoring; `onChange` runs if it moved any comment. */
+export function scheduleReanchor(root: string, onChange: () => void): void {
+  pending = pending.then(() => reanchorToLatest(root)).then((changed) => { if (changed) onChange(); }, () => {});
+}
+
+/** Resolves once every queued re-anchoring has finished. */
+export function settleComments(): Promise<void> {
+  return pending.then(() => {}, () => {});
 }

@@ -8,7 +8,7 @@ import '../mathSumPrecise'; // must precede pdfjs — see the file for why
 import * as pdfjs from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { createComment, type Comment } from '../api';
-import { fold, findHead, findInFolded, stripLatex } from '../sync';
+import { fold, findHead, occurrenceOn, CONTEXT_CHARS, stripLatex } from '../sync';
 import { groupLines, columnsFromTextItems } from '../lines';
 
 // Our own worker module: it installs the Math.sumPrecise polyfill into the
@@ -69,8 +69,6 @@ interface Draft {
   page: number; quote: string; rects: { x: number; y: number; w: number; h: number }[]; x: number; y: number;
   prefix: string; suffix: string;
 }
-// How much page text either side of a selection a comment keeps (as reanchor.ts).
-const CONTEXT_CHARS = 64;
 interface SyncTarget { text: string; nonce: number }
 /** A point on a page (scale-1 units) and the pane position (px) it should sit at. */
 interface Anchor { page: string; ax: number; ay: number; vx: number; vy: number }
@@ -614,15 +612,16 @@ export function PdfView({
     // that same property is what made a two-column page paint across the gutter
     // until the grouping learned about columns. Extracted so the geometry can be
     // unit-tested with synthetic coordinates.
-    const liveBoxes = (page: Element, quote: string): { l: number; t: number; w: number; h: number }[] | null => {
-      const needle = fold(quote).text;
-      if (!needle) return null;
+    const liveBoxes = (page: Element, c: Comment): { l: number; t: number; w: number; h: number }[] | null => {
       const { concat, all, pageBox } = pageText(page);
       // Stored at scale 1 by the renderer; project to what is on screen now.
       const cols: number[] = (() => {
         try { return JSON.parse((page as HTMLElement).dataset.columns ?? '[]') as number[]; } catch { return []; }
       })().map((x) => x * (parseFloat(getComputedStyle(page).getPropertyValue('--scale-factor')) || 1));
-      const match = findInFolded(concat, needle);
+      // The occurrence whose surroundings match the comment's context, so a
+      // word repeated on the page ("Partagée" as frame and block title) lights
+      // up where the comment was made — the one the server placed it by.
+      const match = occurrenceOn(concat, c);
       if (!match) return null;
       const { start: at, end } = match;
       const hits = (line: { spans: Span[] }) => line.spans.filter((s) => s.start < end && s.start + s.len > at);
@@ -664,7 +663,7 @@ export function PdfView({
         const pageEl = container.querySelector(`.page[data-page="${c.page}"]`);
         const layer = pageEl?.querySelector('.hl-layer');
         if (!layer) continue;
-        const boxes = liveBoxes(pageEl!, c.quote);
+        const boxes = liveBoxes(pageEl!, c);
         // The page's own scale, not the zoom state: during a redraw the pages
         // on screen are still the ones drawn at the previous zoom.
         const ps = pageScale(pageEl as HTMLElement);
@@ -678,7 +677,7 @@ export function PdfView({
       const order = Array.from(container.querySelectorAll<HTMLElement>('.page'))
         .sort((a, b) => Math.abs(Number(a.dataset.page) - c.page) - Math.abs(Number(b.dataset.page) - c.page));
       for (const page of order) {
-        const boxes = liveBoxes(page, c.quote);
+        const boxes = liveBoxes(page, c);
         if (!boxes) continue;
         const layer = page.querySelector('.hl-layer')!;
         for (const b of boxes) box(layer, c, statusCls, b.l, b.t, b.w, b.h);

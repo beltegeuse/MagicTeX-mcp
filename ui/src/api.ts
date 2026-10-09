@@ -14,7 +14,9 @@ export type WsMessage =
   | { type: 'reload'; name?: string }
   | { type: 'compiling' }
   | { type: 'compile-error'; log: string }
-  | { type: 'comments-changed' }
+  // quiet: comments only moved with their passage (a recompile); refresh them
+  // without popping the panel open.
+  | { type: 'comments-changed'; quiet?: boolean }
   // Sent once, as the server shuts down. This tab will never reach that server
   // again — and its contents are now history.
   | { type: 'server-closing' }

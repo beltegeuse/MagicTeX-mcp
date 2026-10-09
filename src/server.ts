@@ -14,7 +14,7 @@ import { LIST_CHECKPOINTS_NAME, listCheckpointsConfig } from './tools/listCheckp
 import { CHECK_COMMENTS_NAME, checkCommentsConfig, RESOLVE_COMMENT_NAME, resolveCommentConfig, ADD_COMMENT_NAME, addCommentConfig, REPLY_COMMENT_NAME, replyCommentConfig } from './tools/commentsToolDefs.js';
 import { listComments, updateComment, addComment, addReply } from './preview/commentsStore.js';
 import { findAnchor } from './preview/anchorMatch.js';
-import { latestPageTexts, reanchorToLatest } from './preview/pdfPages.js';
+import { latestPageTexts, reanchorToLatest, settleComments } from './preview/pdfPages.js';
 import { getPreview, peekPreview, captureDiff, shutdownEngine } from './engine/browserHost.js';
 import { setConfig, requestCompile } from './coordinator.js';
 import { setProjectRoot } from './session.js';
@@ -191,6 +191,8 @@ server.registerTool(LIST_CHECKPOINTS_NAME, listCheckpointsConfig, async ({ limit
 server.registerTool(CHECK_COMMENTS_NAME, checkCommentsConfig, async ({ includeResolved }) => {
   const projectRoot = process.cwd();
   setProjectRoot(projectRoot);
+  // A compile that just finished may still be moving comments to their new pages.
+  await settleComments();
   const all = await listComments(projectRoot);
   const accepted = all.filter((c) => c.status === 'accepted');
   const resolved = all.filter((c) => c.status === 'resolved');
@@ -255,6 +257,7 @@ server.registerTool(ADD_COMMENT_NAME, addCommentConfig, async ({ quote, comment,
   });
   // Put it on the page its quote is actually on (the agent's `page` is a hint,
   // 1 by default), and give it the context that keeps it there.
+  await settleComments();
   await reanchorToLatest(projectRoot).catch(() => false);
   try { peekPreview()?.broadcast({ type: 'comments-changed' }); } catch { /* no viewer */ }
   const where = accepted
