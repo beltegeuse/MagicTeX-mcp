@@ -15,9 +15,13 @@ export type WsMessage =
   | { type: 'compiling' }
   | { type: 'compile-error'; log: string }
   | { type: 'comments-changed' }
-  // Sent once, as the server shuts down. Every start binds a fresh port, so this
-  // tab will never reach that server again — and its contents are now history.
-  | { type: 'server-closing' };
+  // Sent once, as the server shuts down. This tab will never reach that server
+  // again — and its contents are now history.
+  | { type: 'server-closing' }
+  // Sent first on every connection: which server start this is. A tab that
+  // meets a different one (a restart on a pinned MAGICTEX_PORT, possibly for
+  // another project) is talking to a server it was not loaded from.
+  | { type: 'hello'; instance: string };
 
 export interface CommentRect { x: number; y: number; w: number; h: number }
 export type CommentStatus = 'suggested' | 'accepted' | 'resolved';
@@ -62,29 +66,55 @@ function requireLive(): void {
   if (serverGone) throw new ServerGoneError();
 }
 
+// The id of the server this page was loaded from, once its socket said hello.
+let instance: string | null = null;
+// Told when a write finds the server gone, so the live channel says so too.
+let onGone: (() => void) | null = null;
+function markGone(): void {
+  serverGone = true;
+  onGone?.();
+}
+
+/**
+ * Every state-changing request goes through here: it names this page's server,
+ * so another server that has since taken the port refuses it (see the server's
+ * instanceGuard.ts) — and that refusal is final for this window.
+ */
+async function writeFetch(url: string, init: RequestInit): Promise<Response> {
+  requireLive();
+  const headers = new Headers(init.headers);
+  if (instance) headers.set('X-MagicTeX-Instance', instance);
+  const r = await fetch(url, { ...init, headers });
+  if (r.status === 409 && r.headers.get('X-MagicTeX-Stale')) { markGone(); throw new ServerGoneError(); }
+  return r;
+}
+/** For the writes that report failure as a string rather than by throwing. */
+async function writeOrMessage(url: string, init: RequestInit): Promise<Response | string> {
+  try { return await writeFetch(url, init); } catch (e) {
+    if (e instanceof ServerGoneError) return e.message;
+    throw e;
+  }
+}
+
 export async function fetchComments(): Promise<Comment[]> {
   const r = await fetch('/api/comments');
   return r.ok ? r.json() : [];
 }
 
 export async function createComment(input: { page: number; quote: string; rects: CommentRect[]; text: string }): Promise<void> {
-  requireLive();
-  await fetch('/api/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+  await writeFetch('/api/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
 }
 
 export async function patchComment(id: string, patch: { status?: CommentStatus; text?: string }): Promise<void> {
-  requireLive();
-  await fetch(`/api/comments?id=${encodeURIComponent(id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+  await writeFetch(`/api/comments?id=${encodeURIComponent(id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
 }
 
 export async function removeComment(id: string): Promise<void> {
-  requireLive();
-  await fetch(`/api/comments?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+  await writeFetch(`/api/comments?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
 export async function replyComment(id: string, text: string): Promise<void> {
-  requireLive();
-  await fetch(`/api/comments/reply?id=${encodeURIComponent(id)}`, {
+  await writeFetch(`/api/comments/reply?id=${encodeURIComponent(id)}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, by: 'human' }),
   });
 }
@@ -107,15 +137,15 @@ export async function fetchDiff(sha: string): Promise<string> {
 
 /** Restore the working tree to a checkpoint (revert). Returns an error string or null. */
 export async function restoreCheckpoint(sha: string): Promise<string | null> {
-  if (serverGone) return new ServerGoneError().message;
-  const r = await fetch(`/git/restore?sha=${encodeURIComponent(sha)}`, { method: 'POST' });
+  const r = await writeOrMessage(`/git/restore?sha=${encodeURIComponent(sha)}`, { method: 'POST' });
+  if (typeof r === 'string') return r;
   return r.ok ? null : (await r.text()) || 'restore failed';
 }
 
 /** Restore a single file to a checkpoint version. Returns an error string or null. */
 export async function restoreFile(sha: string, path: string): Promise<string | null> {
-  if (serverGone) return new ServerGoneError().message;
-  const r = await fetch(`/git/restore-file?sha=${encodeURIComponent(sha)}&path=${encodeURIComponent(path)}`, { method: 'POST' });
+  const r = await writeOrMessage(`/git/restore-file?sha=${encodeURIComponent(sha)}&path=${encodeURIComponent(path)}`, { method: 'POST' });
+  if (typeof r === 'string') return r;
   return r.ok ? null : (await r.text()) || 'restore failed';
 }
 
@@ -153,15 +183,16 @@ export async function fetchTree(): Promise<TreeNode[]> {
 /** Upload a figure/asset to `path` (relative to the project root). */
 export async function uploadFile(path: string, file: File): Promise<string | null> {
   if (serverGone) return new ServerGoneError().message;
-  const r = await fetch(`/api/upload?path=${encodeURIComponent(path)}`, { method: 'POST', body: await file.arrayBuffer() });
+  const r = await writeOrMessage(`/api/upload?path=${encodeURIComponent(path)}`, { method: 'POST', body: await file.arrayBuffer() });
+  if (typeof r === 'string') return r;
   return r.ok ? null : (await r.text()) || 'upload failed';
 }
 /** File-system op: mkfile | mkdir | rename | delete. Returns an error string or null. */
 export async function fsOp(op: string, path: string, to?: string): Promise<string | null> {
-  if (serverGone) return new ServerGoneError().message;
-  const r = await fetch('/api/fs', {
+  const r = await writeOrMessage('/api/fs', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ op, path, to }),
   });
+  if (typeof r === 'string') return r;
   return r.ok ? null : (await r.text()) || 'operation failed';
 }
 
@@ -173,8 +204,7 @@ export async function fsOp(op: string, path: string, to?: string): Promise<strin
  * than a click.
  */
 export async function saveFile(path: string, content: string, compile: boolean): Promise<void> {
-  requireLive();
-  const r = await fetch(`/api/file?path=${encodeURIComponent(path)}&compile=${compile ? 1 : 0}`, {
+  const r = await writeFetch(`/api/file?path=${encodeURIComponent(path)}&compile=${compile ? 1 : 0}`, {
     method: 'PUT', body: content,
   });
   if (!r.ok) throw new Error((await r.text()) || 'save failed');
@@ -183,7 +213,7 @@ export async function saveFile(path: string, content: string, compile: boolean):
 /** Trigger a compile now (the toolbar's manual "Recompile"). */
 export async function recompile(): Promise<void> {
   requireLive();
-  try { await fetch('/api/recompile', { method: 'POST' }); } catch { /* ignore */ }
+  try { await writeFetch('/api/recompile', { method: 'POST' }); } catch (e) { if (e instanceof ServerGoneError) throw e; /* otherwise ignore */ }
 }
 
 /** The document's \title{…} (from the main .tex) for the header, if any. */
@@ -231,6 +261,9 @@ export function useLive(onMessage?: (m: WsMessage) => void) {
     // minutes on a server that was already gone.
     const GIVE_UP_MS = 10_000;
 
+    // A write refused as coming from another server's window: final, like a goodbye.
+    onGone = () => { farewell = true; setStatus('stopped'); ws?.close(); };
+
     const connect = () => {
       ws = new WebSocket(`ws://${location.host}`);
       ws.onopen = () => {
@@ -242,6 +275,19 @@ export function useLive(onMessage?: (m: WsMessage) => void) {
       };
       ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data) as WsMessage;
+        if (msg.type === 'hello') {
+          if (instance && msg.instance !== instance) {
+            // Not the server this page came from — the port was taken over
+            // after a crash. Nothing it says applies here; stop for good.
+            farewell = true;
+            serverGone = true;
+            setStatus('stopped');
+            ws?.close();
+            return;
+          }
+          instance = msg.instance;
+          return;
+        }
         if (msg.type === 'server-closing') {
           // An explicit goodbye: no point retrying, and no point pretending the
           // pane's contents still mean anything.
@@ -279,6 +325,7 @@ export function useLive(onMessage?: (m: WsMessage) => void) {
     connect();
     return () => {
       closed = true;
+      onGone = null;
       // The pending retry has to go too. Without this an unmount inside the
       // one-second window still fired connect(), opening a socket that nothing
       // owned or closed — leaked into the server's client set, where it then

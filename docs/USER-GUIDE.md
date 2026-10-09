@@ -14,6 +14,9 @@
 3. From then on the PDF stays live. Your own editor's saves and Claude's edits auto-recompile;
    in the built-in editor you press **Ctrl+S** / **Recompile** to rebuild (it auto-saves your
    work every 30s without recompiling).
+4. Zoom the PDF with **−** / **+** in its toolbar (click the **%** to fit the width), or with
+   **Ctrl+wheel** / a trackpad pinch over the PDF, which zooms around the cursor. Zoom keeps
+   working in a window whose server has stopped.
 
 ## Slash commands (plugin)
 

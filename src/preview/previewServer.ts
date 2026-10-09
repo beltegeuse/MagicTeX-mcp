@@ -24,6 +24,8 @@ import { buildOverleafZip } from '../export/overleafZip.js';
 import { resolveMainFile } from '../project/resolveMainFile.js';
 import { getProjectRoot } from '../session.js';
 import { busytexDir } from '../engine/assetsDir.js';
+import { requestedPort, listenOn } from './listenPort.js';
+import { newInstanceId, fromOtherInstance, STALE_HEADER } from './instanceGuard.js';
 
 const PKG_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 
@@ -143,6 +145,9 @@ export function startPreviewServer(): Promise<PreviewServerHandle> {
   // own origin, and every request arrives after that.
   let boundPort = 0;
 
+  // Which server start this is; see instanceGuard.ts.
+  const instance = newInstanceId();
+
   const server = createServer(async (req, res) => {
     // Before anything is read or written. This server is reachable from every
     // web page the user visits, because localhost is reachable from every
@@ -152,6 +157,11 @@ export function startPreviewServer(): Promise<PreviewServerHandle> {
       res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8', ...ISOLATION_HEADERS });
       res.end(`MagicTeX refused this request: ${refuse}
 `);
+      return;
+    }
+    if (fromOtherInstance(req, instance)) {
+      res.writeHead(409, { 'Content-Type': 'text/plain; charset=utf-8', [STALE_HEADER]: '1', ...ISOLATION_HEADERS });
+      res.end('This window belongs to a MagicTeX server that has stopped, so it may not change this project. Ask Claude to render a preview again — that opens a new window.\n');
       return;
     }
 
@@ -393,83 +403,88 @@ export function startPreviewServer(): Promise<PreviewServerHandle> {
     res.writeHead(404, ISOLATION_HEADERS).end('not found');
   });
 
-  const wss = new WebSocketServer({
-    server,
-    // Handshakes are exempt from the same-origin policy, so without this any
-    // page can connect, confirm the port, and watch the compile stream.
-    verifyClient: (info: { origin?: string }) => allowWebSocket(info.origin, boundPort),
-  });
-  wss.on('connection', (ws) => {
-    clients.add(ws);
-    ws.on('close', () => clients.delete(ws));
-    // A viewer that connects after a compile already ran still needs the current
-    // PDF and its name (for the download filename) — push it immediately.
-    if (latestPdf) { try { ws.send(JSON.stringify({ type: 'reload', name: latestName })); } catch { /* dropped */ } }
-  });
-
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const addr = server.address();
-      const port = typeof addr === 'object' && addr ? addr.port : 0;
-      boundPort = port;
-      const url = `http://127.0.0.1:${port}`;
-      resolve({
-        server, port, url, viewerUrl: `${url}/viewer`,
-        setLatestPdf: (pdf, name) => { latestPdf = Buffer.from(pdf); latestName = name; send({ type: 'reload', name }); },
-        broadcast: (msg) => send(msg),
-        close: () => new Promise<void>((done) => {
-          // Measured, on the version this replaces: with one WebSocket peer that
-          // never answered a close frame, close() took 30 015 ms — the ws
-          // library's closeTimeout — and an HTTP request sent one second in was
-          // still answered with 200. Both are fatal here, because the MCP client
-          // disconnects with stdin.end() → 2 s → SIGTERM → 2 s → SIGKILL: the
-          // process dies at ~4 s still holding Chromium and the port, which is
-          // the leak this whole path exists to prevent.
-          //
-          // Three things were wrong and all three are fixed below.
-
-          let settled = false;
-          const finish = () => { if (!settled) { settled = true; done(); } };
-
-          // 1. Stop listening FIRST. Previously server.close() ran only inside
-          //    wss.close()'s callback, so the port kept accepting for the whole
-          //    WebSocket drain — and anything that connected in that window was
-          //    then something server.close() had to wait for, unboundedly.
-          server.close(finish);
-          server.closeAllConnections?.();
-
-          // 2. Say goodbye, and wait for it to reach the wire rather than
-          //    guessing. This is the only thing that lets a stale window know it
-          //    is stale, so it is worth the few milliseconds — but not worth
-          //    blocking shutdown on a peer that has stopped reading.
-          let pending = clients.size;
-          const cutSockets = () => {
-            // terminate(), not close(): close() starts a handshake and waits for
-            // a reply that a suspended tab or a half-open TCP connection will
-            // never send. The goodbye has already been flushed (or timed out).
-            for (const ws of clients) { try { ws.terminate(); } catch { /* gone */ } }
-            clients.clear();
-            wss.close();
-            finish();
-          };
-          const flushed = () => { if (--pending <= 0) cutSockets(); };
-          if (pending === 0) {
-            cutSockets();
-          } else {
-            const data = JSON.stringify({ type: 'server-closing' });
-            for (const ws of clients) {
-              try { ws.send(data, flushed); } catch { flushed(); }
-            }
-            // 3. A bound on the goodbye, so one backpressured socket cannot hold
-            //    the process past the client's SIGKILL.
-            setTimeout(cutSockets, GOODBYE_FLUSH_MS).unref();
-          }
-
-          // Whatever else happens, this resolves. A shutdown step that can hang
-          // is worse than one that gives up: the caller is on a 4-second fuse.
-          setTimeout(finish, CLOSE_DEADLINE_MS).unref();
-        }),
-      });
+  const wanted = requestedPort();
+  if (wanted === null) console.error(`[magictex-mcp] MAGICTEX_PORT=${process.env.MAGICTEX_PORT} is not a port number; using a free port`);
+  return listenOn(server, wanted ?? 0).then((port) => {
+    if (wanted && port !== wanted) console.error(`[magictex-mcp] MAGICTEX_PORT ${wanted} is unavailable; the workspace is on port ${port}`);
+    boundPort = port;
+    // Attached only once the port is bound: ws re-emits the HTTP server's
+    // 'error' events on itself, so a MAGICTEX_PORT that was taken surfaced as
+    // an unhandled 'error' on the WebSocketServer and killed the process before
+    // listenOn could fall back to a free port.
+    const wss = new WebSocketServer({
+      server,
+      // Handshakes are exempt from the same-origin policy, so without this any
+      // page can connect, confirm the port, and watch the compile stream.
+      verifyClient: (info: { origin?: string }) => allowWebSocket(info.origin, boundPort),
     });
+    wss.on('connection', (ws) => {
+      clients.add(ws);
+      // First, before anything else: a tab that knew another server must stop
+      // before it acts on a word from this one.
+      try { ws.send(JSON.stringify({ type: 'hello', instance })); } catch { /* dropped */ }
+      ws.on('close', () => clients.delete(ws));
+      // A viewer that connects after a compile already ran still needs the current
+      // PDF and its name (for the download filename) — push it immediately.
+      if (latestPdf) { try { ws.send(JSON.stringify({ type: 'reload', name: latestName })); } catch { /* dropped */ } }
+    });
+    const url = `http://127.0.0.1:${port}`;
+    return {
+      server, port, url, viewerUrl: `${url}/viewer`,
+      setLatestPdf: (pdf, name) => { latestPdf = Buffer.from(pdf); latestName = name; send({ type: 'reload', name }); },
+      broadcast: (msg) => send(msg),
+      close: () => new Promise<void>((done) => {
+        // Measured, on the version this replaces: with one WebSocket peer that
+        // never answered a close frame, close() took 30 015 ms — the ws
+        // library's closeTimeout — and an HTTP request sent one second in was
+        // still answered with 200. Both are fatal here, because the MCP client
+        // disconnects with stdin.end() → 2 s → SIGTERM → 2 s → SIGKILL: the
+        // process dies at ~4 s still holding Chromium and the port, which is
+        // the leak this whole path exists to prevent.
+        //
+        // Three things were wrong and all three are fixed below.
+
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; done(); } };
+
+        // 1. Stop listening FIRST. Previously server.close() ran only inside
+        //    wss.close()'s callback, so the port kept accepting for the whole
+        //    WebSocket drain — and anything that connected in that window was
+        //    then something server.close() had to wait for, unboundedly.
+        server.close(finish);
+        server.closeAllConnections?.();
+
+        // 2. Say goodbye, and wait for it to reach the wire rather than
+        //    guessing. This is the only thing that lets a stale window know it
+        //    is stale, so it is worth the few milliseconds — but not worth
+        //    blocking shutdown on a peer that has stopped reading.
+        let pending = clients.size;
+        const cutSockets = () => {
+          // terminate(), not close(): close() starts a handshake and waits for
+          // a reply that a suspended tab or a half-open TCP connection will
+          // never send. The goodbye has already been flushed (or timed out).
+          for (const ws of clients) { try { ws.terminate(); } catch { /* gone */ } }
+          clients.clear();
+          wss.close();
+          finish();
+        };
+        const flushed = () => { if (--pending <= 0) cutSockets(); };
+        if (pending === 0) {
+          cutSockets();
+        } else {
+          const data = JSON.stringify({ type: 'server-closing' });
+          for (const ws of clients) {
+            try { ws.send(data, flushed); } catch { flushed(); }
+          }
+          // 3. A bound on the goodbye, so one backpressured socket cannot hold
+          //    the process past the client's SIGKILL.
+          setTimeout(cutSockets, GOODBYE_FLUSH_MS).unref();
+        }
+
+        // Whatever else happens, this resolves. A shutdown step that can hang
+        // is worse than one that gives up: the caller is on a 4-second fuse.
+        setTimeout(finish, CLOSE_DEADLINE_MS).unref();
+      }),
+    };
   });
 }
