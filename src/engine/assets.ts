@@ -1,12 +1,13 @@
-// The TeX Live WASM assets (~480MB download, ~649MB on disk) are NOT committed to
+// The TeX Live WASM assets (~520MB download, ~670MB on disk) are NOT committed to
 // git — they're fetched once on first run into a per-user cache (see assetsDir.ts
 // for why not into the package directory). Progress streams to stderr (stdout is
 // the MCP JSON-RPC channel and must stay clean).
-import { mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { busytexDir, busytexDownloadDest, busytexPresent } from './assetsDir.js';
+import { STAMP, busytexDir, busytexDownloadDest, busytexPresent, busytexStampedVersion } from './assetsDir.js';
 
 const requireFrom = createRequire(import.meta.url);
 
@@ -43,22 +44,84 @@ export function downloadCommand(dest: string): { command: string; args: string[]
   return { command: process.execPath, args: [join(dirname(pkgPath), rel), 'download-assets', dest] };
 }
 
-export async function ensureAssets(): Promise<void> {
-  if (busytexPresent()) return;
+/** The texlyre-busytex version installed alongside us — what the assets must match. */
+export function busytexPackageVersion(): string {
+  return (requireFrom(requireFrom.resolve('texlyre-busytex/package.json')) as { version: string }).version;
+}
 
-  const dest = busytexDownloadDest();
-  await mkdir(dest, { recursive: true });
+/** Runs the package's own downloader into `dest` (it creates `dest/busytex`).
+ *  Its stdout goes to OUR stderr, not our stdout: the downloader prints its
+ *  progress with console.log, and our stdout is the MCP JSON-RPC channel — a
+ *  progress bar there is a corrupt message to the client. */
+export const DOWNLOADER_STDIO = ['ignore', 2, 2] as const;
 
-  console.error(`[magictex-mcp] First run: downloading TeX Live WASM assets (~480 MB, one time) into ${busytexDir()}. This can take a few minutes…`);
-  await new Promise<void>((resolve, reject) => {
+function runDownloader(dest: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
     const { command, args } = downloadCommand(dest);
-    const child = spawn(command, args, { stdio: ['ignore', 'inherit', 'inherit'] });
-    child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`asset download failed (exit ${code}). Run manually: npx texlyre-busytex download-assets "${dest}"`))));
+    const child = spawn(command, args, { stdio: [...DOWNLOADER_STDIO] });
+    child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
     child.on('error', reject);
   });
+}
 
-  if (!busytexPresent()) {
-    throw new Error(`Assets download finished but busytex.wasm is still missing from ${busytexDir()}. Run manually: npx texlyre-busytex download-assets "${dest}"`);
+/** What to do by hand if the automatic download fails. The stamp line matters:
+ *  without it the next start takes the hand-made copy for a stale one. */
+function manualHint(version: string): string {
+  const dest = busytexDownloadDest();
+  return `Run manually: npx texlyre-busytex@${version} download-assets "${dest}" and then write ${version} into ${join(busytexDir(), STAMP)}`;
+}
+
+/**
+ * Makes sure the WASM assets exist AND match the installed engine.
+ *
+ * The download never goes into the live directory. texlyre-busytex's downloader
+ * does nothing at all when `busytex/` is non-empty, so a stale copy can't be
+ * refreshed in place — and fetching next to it means a failed or interrupted
+ * download leaves the old, working-for-some-version assets exactly as they were.
+ * Only a complete download is swapped in.
+ *
+ * `download` is injectable so tests can exercise the swap without 500 MB.
+ */
+export async function ensureAssets(download: (dest: string) => Promise<void> = runDownloader): Promise<void> {
+  const version = busytexPackageVersion();
+  const present = busytexPresent();
+  if (present && busytexStampedVersion() === version) return;
+
+  const dir = busytexDir();
+  const parent = dirname(dir);
+  await mkdir(parent, { recursive: true });
+
+  if (present) {
+    const was = busytexStampedVersion();
+    console.error(`[magictex-mcp] TeX engine is now texlyre-busytex ${version}${was ? ` (assets are for ${was})` : ''}: refreshing the WASM TeX Live assets in ${dir} (~520 MB, one time). This can take a few minutes…`);
+  } else {
+    console.error(`[magictex-mcp] First run: downloading TeX Live WASM assets (~520 MB, one time) into ${dir}. This can take a few minutes…`);
   }
+
+  const staging = join(parent, `.busytex-download-${process.pid}`);
+  const old = `${dir}.old-${process.pid}`;
+  await rm(staging, { recursive: true, force: true });
+  try {
+    try {
+      await download(staging);
+    } catch (err) {
+      throw new Error(`asset download failed (${(err as Error).message}). ${manualHint(version)}`);
+    }
+    const fetched = join(staging, 'busytex');
+    if (!existsSync(join(fetched, 'busytex.wasm'))) {
+      throw new Error(`Assets download finished but busytex.wasm is missing from it. ${manualHint(version)}`);
+    }
+    await writeFile(join(fetched, STAMP), `${version}\n`);
+    if (existsSync(dir)) await rename(dir, old);
+    try {
+      await rename(fetched, dir);
+    } catch (err) {
+      if (existsSync(old)) await rename(old, dir);
+      throw err;
+    }
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+  await rm(old, { recursive: true, force: true });
   console.error('[magictex-mcp] Assets ready.');
 }
