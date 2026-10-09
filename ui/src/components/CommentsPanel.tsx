@@ -46,8 +46,14 @@ export function CommentsPanel({
       <div className="comment-quote">
         {c.role && c.role !== 'human' && <span className={`role-badge role-${c.role}`}>{c.role}</span>}
         p.{c.page} · “{c.quote.slice(0, 90)}{c.quote.length > 90 ? '…' : ''}”
-        {c.stale && c.status !== 'resolved' && (
-          <span className="stale-badge" title="This passage is no longer in the PDF — it was probably edited.">passage not found</span>
+        {c.stale && (
+          <span className="stale-badge" title="The passage is no longer in the PDF; this page is an estimate.">page estimated</span>
+        )}
+        {c.current === '' && <span className="edit-badge" title="The quoted passage was deleted.">deleted</span>}
+        {c.current && (
+          <span className="edit-badge" title={`Now: ${c.current}`}>
+            edited → “{c.current.slice(0, 60)}{c.current.length > 60 ? '…' : ''}”
+          </span>
         )}
       </div>
       <div className="comment-text">{c.text}</div>

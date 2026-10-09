@@ -2,9 +2,9 @@
 //
 // The coordinator hands every clean PDF to setLatestPdfText; the text is
 // extracted lazily (pdf.js, ~4 ms a page) and only when something asks — the
-// re-anchoring after a compile, which does so only when a comment is open,
+// re-anchoring after a compile, which does so only when there are comments,
 // and check_comments, to tell a comment's source location apart by its page.
-import { listComments, reanchorComments, type Comment } from './commentsStore.js';
+import { listComments, reanchorComments } from './commentsStore.js';
 import { anchorUpdate, foldPages } from './reanchor.js';
 
 let latest: { pdf: Uint8Array; pages?: Promise<string[] | null> } | null = null;
@@ -41,23 +41,22 @@ export function latestPageTexts(): Promise<string[] | null> {
   return latest.pages;
 }
 
-/** Whether a comment is still open (re-anchoring leaves resolved ones be). */
-const isOpen = (c: Comment) => c.status !== 'resolved';
-
 /**
- * Move every open comment to the page its quote is on now. Resolves to whether
- * any comment changed, so the caller knows to tell the workspace.
+ * Move every comment to where its passage is now. Resolved ones too: their
+ * green highlight is what the author reviews, and addressing a comment is
+ * exactly what rewrites its text. Resolves to whether any comment changed, so
+ * the caller knows to tell the workspace.
  */
 export async function reanchorToLatest(root: string): Promise<boolean> {
-  // A cheap read first: with no open comment, the PDF is never parsed.
-  if (!(await listComments(root)).some(isOpen)) return false;
+  // A cheap read first: with no comment at all, the PDF is never parsed.
+  if (!(await listComments(root)).length) return false;
   const pages = await latestPageTexts();
   if (!pages) return false;
   const folded = foldPages(pages);
   // No extractable text (Type3 bitmap fonts, fonts without a ToUnicode map):
   // that says nothing about where any passage went.
   if (!folded.some((t) => t.length)) return false;
-  return reanchorComments(root, (c) => (isOpen(c) ? anchorUpdate(folded, pages, c) : null));
+  return reanchorComments(root, (c) => anchorUpdate(folded, pages, c));
 }
 
 // Re-anchorings run one at a time, off the compile chain: a compile publishes

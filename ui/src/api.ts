@@ -42,8 +42,10 @@ export interface Comment {
   resolvedNote?: string;
   prefix?: string;
   suffix?: string;
-  /** Its quote is not in the latest PDF; `page` is where it last was. */
+  /** Its passage is not in the latest PDF; `page` is an estimate. */
   stale?: boolean;
+  /** What now stands where the quote was ('' = deleted); absent while it is still there. */
+  current?: string;
 }
 
 /**

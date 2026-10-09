@@ -201,20 +201,31 @@ server.registerTool(CHECK_COMMENTS_NAME, checkCommentsConfig, async ({ includeRe
   // instruction, and the source file:line it anchors to (best-effort text match,
   // told apart by the comment's page when the quote appears more than once).
   const pages = accepted.length ? await latestPageTexts() : null;
+  // What became of the passage: rewritten or deleted (usually by addressing the
+  // comment), or gone altogether so that the page is only an estimate.
+  const fate = (c: (typeof all)[number]) =>
+    (c.current === '' ? ' (passage deleted)'
+      : c.current !== undefined ? ` (passage edited, now: "${c.current.slice(0, 120)}${c.current.length > 120 ? '…' : ''}")`
+        : '')
+    + (c.stale ? ' (page estimated — passage not found in the PDF)' : '');
   const fmtLocated = async (c: (typeof all)[number]) => {
-    const anchor = await findAnchor(projectRoot, c.quote, { prefix: c.prefix, suffix: c.suffix, pageText: pages?.[c.page - 1] });
+    const ctx = { prefix: c.prefix, suffix: c.suffix, pageText: pages?.[c.page - 1] };
+    // The quote, or once it has been rewritten, what replaced it — or, deleted,
+    // the text that followed it.
+    const anchor = await findAnchor(projectRoot, c.quote, ctx)
+      ?? (c.current ? await findAnchor(projectRoot, c.current, ctx) : null)
+      ?? (c.current === '' && c.suffix ? await findAnchor(projectRoot, c.suffix.slice(0, 48), ctx) : null);
     const loc = anchor
       ? `\n  ↳ source: ${anchor.file}:${anchor.line}`
       : '\n  ↳ source: not located — search the files for the quoted text';
-    const stale = c.stale ? ' (passage no longer in the PDF — it may already have been edited)' : '';
     const who = c.role && c.role !== 'human' ? ` (${c.role})` : '';
     const thread = c.replies?.length
       ? '\n  ' + c.replies.map((r) => `↪ ${r.by}: ${r.text}`).join('\n  ')
       : '';
-    return `[id: ${c.id}]${who} p.${c.page}${stale} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"${loc}\n  → ${c.text}${thread}`;
+    return `[id: ${c.id}]${who} p.${c.page}${fate(c)} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"${loc}\n  → ${c.text}${thread}`;
   };
   const fmtPlain = (c: (typeof all)[number]) =>
-    `[id: ${c.id}] p.${c.page} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"\n  → ${c.text}`;
+    `[id: ${c.id}] p.${c.page}${fate(c)} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"\n  → ${c.text}`;
   const awaiting = suggested.length
     ? `\n\n(${suggested.length} reviewer suggestion${suggested.length === 1 ? '' : 's'} still ${suggested.length === 1 ? 'awaits' : 'await'} the human's accept in the workspace — not actionable yet.)`
     : '';

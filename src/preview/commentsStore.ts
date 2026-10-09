@@ -42,8 +42,19 @@ export interface Comment {
   /** Page text just before / after the quote, to tell repeated passages apart. */
   prefix?: string;
   suffix?: string;
-  /** The quote was not found in the latest PDF: `page` is where it last was. */
+  /**
+   * The passage itself was not found in the latest PDF: `page` is an estimate
+   * (or, with nothing to go on, where it last was).
+   */
   stale?: boolean;
+  /**
+   * The text that now stands where the quote was — usually because the comment
+   * was addressed. '' when the passage was deleted; absent while the quote is
+   * still there.
+   */
+  current?: string;
+  /** Distinctive phrases of the quote's page, to estimate its page if all else is gone. */
+  pageSig?: string[];
 }
 
 const FILE = 'comments.json';
@@ -115,6 +126,8 @@ export async function listComments(root: string): Promise<Comment[]> {
     if (!Array.isArray(c.replies)) c.replies = [];
     if (typeof c.prefix !== 'string') delete c.prefix;
     if (typeof c.suffix !== 'string') delete c.suffix;
+    if (typeof c.current !== 'string') delete c.current;
+    if (!Array.isArray(c.pageSig) || !c.pageSig.every((p) => typeof p === 'string')) delete c.pageSig;
   }
   return parsed as Comment[];
 }
@@ -208,8 +221,8 @@ export async function addReply(
 
 /**
  * Re-place every comment against a new PDF. `place` returns the fields that
- * changed for a comment (or null to leave it alone); a `stale: false` clears
- * the flag. Writes only if something actually changed, so a recompile that
+ * changed for a comment (or null to leave it alone); `stale: false` and
+ * `current: null` clear those fields. Writes only if something actually changed, so a recompile that
  * moved nothing doesn't touch the file. Resolves to whether it did.
  */
 export async function reanchorComments(root: string, place: (c: Comment) => AnchorUpdate | null): Promise<boolean> {
@@ -227,6 +240,11 @@ export async function reanchorComments(root: string, place: (c: Comment) => Anch
         if (u.stale) c.stale = true; else delete c.stale;
         changed = true;
       }
+      if (u.current !== undefined && u.current !== (c.current ?? null)) {
+        if (u.current === null) delete c.current; else c.current = u.current;
+        changed = true;
+      }
+      if (u.pageSig !== undefined && JSON.stringify(u.pageSig) !== JSON.stringify(c.pageSig)) { c.pageSig = u.pageSig; changed = true; }
     }
     if (changed) await save(root, all);
     return changed;

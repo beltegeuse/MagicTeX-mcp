@@ -8,7 +8,7 @@ import '../mathSumPrecise'; // must precede pdfjs — see the file for why
 import * as pdfjs from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { createComment, type Comment } from '../api';
-import { fold, findHead, occurrenceOn, CONTEXT_CHARS, stripLatex } from '../sync';
+import { fold, findHead, locateOn, CONTEXT_CHARS, stripLatex } from '../sync';
 import { groupLines, columnsFromTextItems } from '../lines';
 
 // Our own worker module: it installs the Math.sumPrecise polyfill into the
@@ -612,7 +612,7 @@ export function PdfView({
     // that same property is what made a two-column page paint across the gutter
     // until the grouping learned about columns. Extracted so the geometry can be
     // unit-tested with synthetic coordinates.
-    const liveBoxes = (page: Element, c: Comment): { l: number; t: number; w: number; h: number }[] | null => {
+    const liveBoxes = (page: Element, c: Comment): { l: number; t: number; w: number; h: number; cls?: string }[] | null => {
       const { concat, all, pageBox } = pageText(page);
       // Stored at scale 1 by the renderer; project to what is on screen now.
       const cols: number[] = (() => {
@@ -620,10 +620,23 @@ export function PdfView({
       })().map((x) => x * (parseFloat(getComputedStyle(page).getPropertyValue('--scale-factor')) || 1));
       // The occurrence whose surroundings match the comment's context, so a
       // word repeated on the page ("Partagée" as frame and block title) lights
-      // up where the comment was made — the one the server placed it by.
-      const match = occurrenceOn(concat, c);
+      // up where the comment was made — the one the server placed it by. Once
+      // the passage was rewritten (the comment addressed), it is what now
+      // stands between that context.
+      const match = locateOn(concat, c);
       if (!match) return null;
       const { start: at, end } = match;
+      if (at === end) {
+        // Deleted: a thin caret where the passage was, between the text that
+        // was before it and the text that was after it.
+        const after = all.find((s) => s.start <= at && at < s.start + s.len);
+        const before = all.find((s) => s.start < at && at === s.start + s.len);
+        const host = after ?? before;
+        if (!host) return null;
+        const x = after ? edgeInSpan(after, at - after.start, 'left', pageBox.left) ?? after.l
+          : edgeInSpan(before!, at - 1 - before!.start, 'right', pageBox.left) ?? before!.l + before!.w;
+        return [{ l: x - 1, t: host.t, w: 3, h: host.h, cls: 'hl-caret' }];
+      }
       const hits = (line: { spans: Span[] }) => line.spans.filter((s) => s.start < end && s.start + s.len > at);
 
       // Shape it like a text selection: the first touched line starts at the
@@ -667,8 +680,10 @@ export function PdfView({
         // The page's own scale, not the zoom state: during a redraw the pages
         // on screen are still the ones drawn at the previous zoom.
         const ps = pageScale(pageEl as HTMLElement);
-        if (boxes) for (const b of boxes) box(layer, c, statusCls, b.l, b.t, b.w, b.h);
-        else for (const r of c.rects) box(layer, c, statusCls, r.x * ps, r.y * ps, r.w * ps, r.h * ps);
+        if (boxes) for (const b of boxes) box(layer, c, `${statusCls} ${b.cls ?? ''}`, b.l, b.t, b.w, b.h);
+        // Nothing left to find: the frozen boxes, dashed when the passage is
+        // known to be gone — an estimate, not a claim about the text under them.
+        else for (const r of c.rects) box(layer, c, `${statusCls} ${c.stale ? 'hl-stale' : ''}`, r.x * ps, r.y * ps, r.w * ps, r.h * ps);
         continue;
       }
       // Reviewer/agent comment posted without PDF coords, or one the server just
@@ -680,7 +695,7 @@ export function PdfView({
         const boxes = liveBoxes(page, c);
         if (!boxes) continue;
         const layer = page.querySelector('.hl-layer')!;
-        for (const b of boxes) box(layer, c, statusCls, b.l, b.t, b.w, b.h);
+        for (const b of boxes) box(layer, c, `${statusCls} ${b.cls ?? ''}`, b.l, b.t, b.w, b.h);
         break;
       }
     }
