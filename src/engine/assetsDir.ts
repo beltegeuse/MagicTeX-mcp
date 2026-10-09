@@ -7,7 +7,7 @@
 //
 // A per-user cache survives upgrades, and is shared between an npx run, a global
 // install and a checkout instead of each keeping its own copy.
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -64,4 +64,21 @@ export function busytexDownloadDest(): string {
 /** True once the assets are actually present, not merely expected. */
 export function busytexPresent(): boolean {
   return existsSync(join(busytexDir(), MARKER));
+}
+
+/** Which texlyre-busytex release the assets were downloaded for. Present is not
+ *  the same as current: the engine's JS ships in node_modules and moves with
+ *  every upgrade, but the assets sit in a cache that outlives it. 1.4.0's runner
+ *  loads busytex_biber.js at init, so a cache fetched for 1.2.x — busytex.wasm
+ *  and all — fails to start. The stamp is how we notice. */
+export const STAMP = '.magictex-busytex-version';
+
+/** The version the stamp records, or null for assets that predate stamping (or
+ *  were downloaded by hand). */
+export function busytexStampedVersion(): string | null {
+  try {
+    return readFileSync(join(busytexDir(), STAMP), 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
 }
