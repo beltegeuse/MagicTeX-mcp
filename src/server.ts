@@ -3,7 +3,7 @@
 // Everything heavy (headless browser, WASM engine, preview server, file watcher)
 // is lazily started on the first render_preview call, so merely connecting is cheap.
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -101,7 +101,7 @@ server.registerTool(RENDER_PREVIEW_NAME, renderPreviewConfig, async ({ mainFile,
         );
       }
       if (errs) {
-        notes.push(summarizeErrors(result.log || ''));
+        notes.push(summarizeErrors(result.log || '', posix.dirname(result.mainFile)));
         // Only worth saying when system isn't what already ran — under the
         // 'auto' default a local TeX is picked up on its own, so anyone seeing
         // this has no local TeX at all. "Retry with backend: system if you have
@@ -141,7 +141,7 @@ server.registerTool(RENDER_PREVIEW_NAME, renderPreviewConfig, async ({ mainFile,
       : '';
     return {
       isError: true,
-      content: [{ type: 'text', text: `✖ Compile of ${result.mainFile} failed (${result.engine}).\n\n${summarizeErrors(result.log || result.error || '')}${toolHint}${clsHint}${pkgHint}` }],
+      content: [{ type: 'text', text: `✖ Compile of ${result.mainFile} failed (${result.engine}).\n\n${summarizeErrors(result.log || result.error || '', posix.dirname(result.mainFile))}${toolHint}${clsHint}${pkgHint}` }],
     };
   } catch (err) {
     const msg = err instanceof MainFileError ? err.message : String((err as Error).message ?? err);

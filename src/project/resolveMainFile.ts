@@ -4,7 +4,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-const DOCUMENTCLASS = /^\s*\\documentclass/m;
+export const DOCUMENTCLASS = /^\s*\\documentclass/m;
 
 export class MainFileError extends Error {}
 

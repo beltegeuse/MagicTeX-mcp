@@ -1,10 +1,11 @@
 // The one shared compile path: resolve main file -> gather project -> compile.
 // Both the render_preview MCP tool and (later) the file watcher call this.
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join, posix, relative } from 'node:path';
 import { resolveMainFile } from './resolveMainFile.js';
+import { detectEngine } from './detectEngine.js';
 import { collectProjectFiles, countProjectFiles, type CollectResult } from './collectProjectFiles.js';
-import { getFallbackStyles } from '../engine/fallbackStyles.js';
+import { getFallbackStyles, placeFallbacks } from '../engine/fallbackStyles.js';
 import { compile, type CompileOutput } from '../engine/browserHost.js';
 import { probeSystemTex, compileWithSystemTex, systemTexUnavailableMessage, type SystemTexProbe, type SystemFallback } from '../engine/systemTex.js';
 import { classifyCompile, stubPackage, usesPackage, type CompileVerdict } from '../engine/compileLog.js';
@@ -47,7 +48,7 @@ export interface CompileProjectOptions {
 }
 
 export async function compileProject(opts: CompileProjectOptions): Promise<CompileProjectResult> {
-  const mainFile = await resolveMainFile(opts.projectRoot, opts.mainFile);
+  const mainFile = projectRelative(opts.projectRoot, await resolveMainFile(opts.projectRoot, opts.mainFile));
 
   // Deferred, because only the WASM engine needs it: it is handed every file as
   // a string, so the whole project has to be in memory. latexmk is given a
@@ -97,7 +98,7 @@ export async function compileProject(opts: CompileProjectOptions): Promise<Compi
       ? { count: collected.files.length, truncated: collected.truncated }
       : await countProjectFiles(opts.projectRoot);
     if (backend === 'system' && !sysProbe.usable) {
-      return { success: false, pdf: undefined, pdfLen: 0, log: '', ms: 0, error: systemTexUnavailableMessage(sysProbe), mainFile, engine, backend: 'system', fileCount: size.count, truncated: size.truncated };
+      return { success: false, pdf: undefined, pdfLen: 0, log: '', ms: 0, error: systemTexUnavailableMessage(sysProbe), mainFile: mainRel, engine, backend: 'system', fileCount: size.count, truncated: size.truncated };
     }
     const out = await compileWithSystemTex(opts.projectRoot, mainRel, engine, opts.shellEscape ?? false);
     const sysVerdict = classifyCompile(out.log ?? '', out.pdfLen);
@@ -105,14 +106,14 @@ export async function compileProject(opts: CompileProjectOptions): Promise<Compi
     // Keep the system result whenever it produced something usable — a real TeX
     // with warnings still beats the bundled subset for fidelity.
     if (out.success && sysVerdict.usable) {
-      return { ...out, verdict: sysVerdict, mainFile, engine, backend: 'system', fileCount: size.count, truncated: size.truncated };
+      return { ...out, verdict: sysVerdict, mainFile: mainRel, engine, backend: 'system', fileCount: size.count, truncated: size.truncated };
     }
 
     // Forced 'system' does not fall back. Asking for that backend is a statement
     // that you want that toolchain or an error; quietly substituting another one
     // would answer a question nobody asked.
     if (backend === 'system') {
-      return { ...out, success: false, verdict: sysVerdict, mainFile, engine, backend: 'system', fileCount: size.count, truncated: size.truncated };
+      return { ...out, success: false, verdict: sysVerdict, mainFile: mainRel, engine, backend: 'system', fileCount: size.count, truncated: size.truncated };
     }
 
     // 'auto': the local TeX couldn't produce a PDF, so continue to the bundled
@@ -132,8 +133,8 @@ export async function compileProject(opts: CompileProjectOptions): Promise<Compi
 
   // Inject bundled fallback .sty for packages busytex omits — but only those the
   // project doesn't already ship (a project's own copy always wins).
-  const present = new Set(files.map((f) => f.path.split('/').pop()));
-  const fallbacks = (await getFallbackStyles()).filter((f) => !present.has(f.path));
+  // Placed next to the main file, where the bundled TeX actually looks.
+  const fallbacks = placeFallbacks(await getFallbackStyles(), files, mainRel);
   const allFiles = fallbacks.length ? [...files, ...fallbacks] : files;
 
   // Enable a bib pass + reruns only when the document actually needs them —
@@ -156,7 +157,7 @@ export async function compileProject(opts: CompileProjectOptions): Promise<Compi
   if (verdict.fatal && verdict.missingPackages.length) {
     const unused = verdict.missingPackages.filter((p) => !usesPackage(p, mainSrc));
     if (unused.length) {
-      const stubs = unused.map((p) => ({ path: `${p}.sty`, content: stubPackage(p), encoding: 'utf8' as const }));
+      const stubs = unused.map((p) => ({ path: posix.join(posix.dirname(mainRel), `${p}.sty`), content: stubPackage(p), encoding: 'utf8' as const }));
       const retryOut = await compile([...allFiles, ...stubs], mainRel, engine, { bibtex, rerun: needsRerun });
       const retryVerdict = classifyCompile(retryOut.log ?? '', retryOut.pdfLen);
       // Keep the retry only if it actually got further; otherwise report the
@@ -179,7 +180,7 @@ export async function compileProject(opts: CompileProjectOptions): Promise<Compi
     stubbedPackages: stubbed,
     systemTex: sysProbe,
     systemFallback,
-    mainFile,
+    mainFile: mainRel,
     engine,
     backend: 'wasm',
     fileCount: files.length,
@@ -187,9 +188,10 @@ export async function compileProject(opts: CompileProjectOptions): Promise<Compi
   };
 }
 
-// Pick an engine from the preamble: fontspec/unicode-math need xe/lua; otherwise
-// default to xelatex (broadest font/UTF-8 support, matches modern Overleaf defaults).
-function detectEngine(src: string): Engine {
-  if (/\\usepackage\{(fontspec|unicode-math)\}/.test(src)) return 'xelatex';
-  return 'xelatex';
+/** The main file as a forward-slash path relative to the project root, whatever
+ *  form it was given in: a Windows path or an absolute one would otherwise make
+ *  every "the main file's directory" computation downstream disagree. */
+function projectRelative(root: string, mainFile: string): string {
+  const rel = isAbsolute(mainFile) ? relative(root, mainFile) : mainFile;
+  return rel.replace(/\\/g, '/');
 }

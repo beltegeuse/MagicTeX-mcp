@@ -5,7 +5,8 @@
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, mkdir } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import type { CompileOutput } from './browserHost.js';
 import type { Engine } from '../project/compileProject.js';
 
@@ -287,11 +288,24 @@ export function killTree(pid: number): void {
 }
 
 /** Compile `mainRelPath` (relative to `root`) with local latexmk; artifacts go
- *  under .latex-preview/build so the project tree stays clean. */
+ *  under .latex-preview/build so the project tree stays clean.
+ *
+ *  latexmk runs from the main file's own directory, not the project root: a
+ *  document in `lectures/week6/` that says `\input{style}` or
+ *  `\graphicspath{{fig/}}` means files next to itself, as under `latexmk -cd`.
+ *  The bundled engine already chdirs there, so this keeps the two backends
+ *  resolving paths the same way.
+ *
+ *  Projects written against the old behaviour keep compiling: the root stays on
+ *  TEXINPUTS behind the main file's directory, so `\input{lectures/common/x}`
+ *  still resolves, and a root latexmkrc is still read unless the main file's
+ *  directory has its own. */
 export async function compileWithSystemTex(root: string, mainRelPath: string, engine: Engine, shellEscape = false): Promise<CompileOutput> {
   const started = Date.now();
   const outdir = join(root, '.latex-preview', 'build');
   await mkdir(outdir, { recursive: true });
+  // resolve, not join: an absolute mainFile names its directory outright.
+  const mainDir = resolve(root, dirname(mainRelPath));
   // -shell-escape lets the document execute arbitrary shell commands, so it is
   // opt-in per call rather than a default. Packages like svg and minted cannot
   // work without it, and the user is the only one who can say whether this
@@ -299,10 +313,11 @@ export async function compileWithSystemTex(root: string, mainRelPath: string, en
   const args = [
     ENGINE_FLAG[engine] ?? '-pdf', '-interaction=nonstopmode', '-file-line-error',
     ...(shellEscape ? ['-shell-escape'] : []),
-    `-outdir=${outdir}`, mainRelPath,
+    ...rootRcArgs(root, mainDir),
+    `-outdir=${outdir}`, basename(mainRelPath),
   ];
 
-  const { code, out, stopped } = await runLatexmk(root, args);
+  const { code, out, stopped } = await runLatexmk(mainDir, args, rootOnTexinputs(root, mainDir));
 
   if (stopped) {
     const waited = Math.round((Date.now() - started) / 1000);
@@ -330,12 +345,35 @@ export async function compileWithSystemTex(root: string, mainRelPath: string, en
   return { success: false, exitCode: code ?? 1, pdf: undefined, pdfLen: 0, log: out, ms: Date.now() - started, error: 'system latexmk compile failed' };
 }
 
+// latexmk reads the first of these it finds in its working directory.
+const RC_NAMES = ['latexmkrc', '.latexmkrc'];
+
+/** `-r <root rc>` when the main file sits below a root that has a latexmkrc and
+ *  its own directory has none — latexmk only looks in its working directory, so
+ *  moving that into the subdirectory would otherwise drop the root's settings.
+ *  A latexmkrc beside the main file is the closer one and wins on its own. */
+function rootRcArgs(root: string, mainDir: string): string[] {
+  if (resolve(mainDir) === resolve(root)) return [];
+  if (RC_NAMES.some((n) => existsSync(join(mainDir, n)))) return [];
+  const rc = RC_NAMES.map((n) => join(root, n)).find((p) => existsSync(p));
+  return rc ? ['-r', rc] : [];
+}
+
+/** The environment for latexmk: TEXINPUTS gets the main file's directory first,
+ *  then the project root (not recursively), then whatever was there before — the
+ *  trailing empty entry keeps TeX's default search path. */
+function rootOnTexinputs(root: string, mainDir: string): NodeJS.ProcessEnv | undefined {
+  if (resolve(mainDir) === resolve(root)) return undefined;
+  return { ...process.env, TEXINPUTS: ['.', resolve(root), process.env.TEXINPUTS ?? ''].join(delimiter) };
+}
+
 /** Run latexmk, collecting output and watching for silence. Resolves rather than
  *  throws: a non-zero exit is an ordinary outcome here, not an exception. */
-function runLatexmk(cwd: string, args: string[]): Promise<{ code: number | null; out: string; stopped?: 'idle' | 'cap' }> {
+function runLatexmk(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<{ code: number | null; out: string; stopped?: 'idle' | 'cap' }> {
   return new Promise((resolve) => {
     const child = spawn('latexmk', args, {
       cwd,
+      env,
       windowsHide: true,
       // POSIX: its own process group, so killTree can take the group down.
       detached: process.platform !== 'win32',

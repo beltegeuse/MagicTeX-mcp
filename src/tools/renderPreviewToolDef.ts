@@ -8,11 +8,11 @@ export const renderPreviewInputSchema = {
   mainFile: z
     .string()
     .optional()
-    .describe('Path to the main .tex file, relative to the project root. Auto-detected (by scanning for \\documentclass) if omitted.'),
+    .describe('Path to the main .tex file, relative to the project root. Auto-detected (by scanning for \\documentclass) if omitted. TeX runs from this file\'s directory, so its \\input and \\graphicspath paths resolve relative to it.'),
   engine: z
     .enum(['pdflatex', 'xelatex', 'lualatex'])
     .optional()
-    .describe('TeX engine. Defaults to xelatex.'),
+    .describe('TeX engine. Omit it to use the main file\'s `% !TEX program = pdflatex|xelatex|lualatex` line when it has one (before \\documentclass), else xelatex.'),
   shellEscape: z
     .boolean()
     .optional()
