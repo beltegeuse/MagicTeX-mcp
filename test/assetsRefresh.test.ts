@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DOWNLOADER_STDIO, busytexPackageVersion, ensureAssets } from '../src/engine/assets.js';
+import { DOWNLOADER_STDIO, INIT_FILES, busytexPackageVersion, ensureAssets } from '../src/engine/assets.js';
 import { STAMP } from '../src/engine/assetsDir.js';
 
 // texlyre-busytex 1.4.0's runner loads busytex_biber.js at init. A cache fetched
@@ -104,6 +104,53 @@ test('a download with no busytex.wasm in it is not swapped in', withCache(oldAss
 test('a fresh install downloads into place', withCache(() => {}, quiet(async (dir) => {
   await ensureAssets(fakeDownloader([]));
   assert.equal(readFileSync(join(dir, STAMP), 'utf8').trim(), busytexPackageVersion());
+})));
+
+test('unstamped assets that have every init file are adopted, not re-downloaded', withCache((dir) => {
+  // The README's pre-fetch, a hand copy on an offline machine: replacing either
+  // would cost 520 MB, or fail outright without network.
+  mkdirSync(dir, { recursive: true });
+  for (const f of INIT_FILES) writeFileSync(join(dir, f), 'x');
+}, quiet(async (dir) => {
+  const calls: string[] = [];
+  await ensureAssets(fakeDownloader(calls));
+  assert.equal(calls.length, 0);
+  assert.equal(readFileSync(join(dir, STAMP), 'utf8').trim(), busytexPackageVersion());
+})));
+
+test('complete assets stamped for another version are still refreshed', withCache((dir) => {
+  mkdirSync(dir, { recursive: true });
+  for (const f of INIT_FILES) writeFileSync(join(dir, f), 'x');
+  writeFileSync(join(dir, STAMP), '1.4.0-other\n');
+}, quiet(async () => {
+  const calls: string[] = [];
+  await ensureAssets(fakeDownloader(calls));
+  assert.equal(calls.length, 1, 'a stamp is a claim about the version; only unstamped copies get the benefit of the doubt');
+})));
+
+test('losing the swap race to another session refreshing the same version is fine', withCache(oldAssets, quiet(async (dir, root) => {
+  const version = busytexPackageVersion();
+  await ensureAssets(async (dest) => {
+    await fakeDownloader([])(dest);
+    // Meanwhile another session finished first and swapped its copy in.
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'busytex.wasm'), 'theirs');
+    writeFileSync(join(dir, STAMP), `${version}\n`);
+  });
+  assert.equal(readFileSync(join(dir, 'busytex.wasm'), 'utf8'), 'theirs', 'the copy already in place is kept');
+  assert.deepEqual(readdirSync(root), ['busytex']);
+})));
+
+test('staging and backup dirs left by a killed refresh are swept', withCache(oldAssets, quiet(async (dir, root) => {
+  // A pid that certainly exited: a child we already waited for.
+  const dead = spawnSync(process.execPath, ['-e', '']).pid!;
+  mkdirSync(join(root, `.busytex-download-${dead}`, 'busytex'), { recursive: true });
+  mkdirSync(join(root, `busytex.old-${process.pid}`), { recursive: true });
+  // A live pid's staging dir is another session's download in progress.
+  mkdirSync(join(root, `.busytex-download-${process.ppid}`), { recursive: true });
+  await ensureAssets(fakeDownloader([]));
+  assert.deepEqual(readdirSync(root).sort(), [`.busytex-download-${process.ppid}`, 'busytex'].sort());
 })));
 
 test("the downloader's stdout cannot reach ours — that is the MCP channel", () => {
