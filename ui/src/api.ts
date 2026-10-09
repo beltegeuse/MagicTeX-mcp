@@ -38,6 +38,10 @@ export interface Comment {
   replies?: Reply[];
   created: string;
   resolvedNote?: string;
+  prefix?: string;
+  suffix?: string;
+  /** Its quote is not in the latest PDF; `page` is where it last was. */
+  stale?: boolean;
 }
 
 /**
@@ -101,7 +105,9 @@ export async function fetchComments(): Promise<Comment[]> {
   return r.ok ? r.json() : [];
 }
 
-export async function createComment(input: { page: number; quote: string; rects: CommentRect[]; text: string }): Promise<void> {
+export async function createComment(input: {
+  page: number; quote: string; rects: CommentRect[]; text: string; prefix?: string; suffix?: string;
+}): Promise<void> {
   await writeFetch('/api/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
 }
 

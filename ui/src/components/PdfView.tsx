@@ -65,7 +65,12 @@ const pageScale = (el: HTMLElement) => parseFloat(el.style.getPropertyValue('--s
 const textSpans = (page: Element) =>
   (Array.from(page.querySelectorAll('.textLayer span')) as HTMLElement[]).filter((s) => !s.firstElementChild);
 
-interface Draft { page: number; quote: string; rects: { x: number; y: number; w: number; h: number }[]; x: number; y: number }
+interface Draft {
+  page: number; quote: string; rects: { x: number; y: number; w: number; h: number }[]; x: number; y: number;
+  prefix: string; suffix: string;
+}
+// How much page text either side of a selection a comment keeps (as reanchor.ts).
+const CONTEXT_CHARS = 64;
 interface SyncTarget { text: string; nonce: number }
 /** A point on a page (scale-1 units) and the pane position (px) it should sit at. */
 interface Anchor { page: string; ax: number; ay: number; vx: number; vy: number }
@@ -667,8 +672,12 @@ export function PdfView({
         else for (const r of c.rects) box(layer, c, statusCls, r.x * ps, r.y * ps, r.w * ps, r.h * ps);
         continue;
       }
-      // Reviewer/agent comment posted without PDF coords → find the quote anywhere.
-      for (const page of container.querySelectorAll('.page')) {
+      // Reviewer/agent comment posted without PDF coords, or one the server just
+      // moved to another page → find the quote, starting at the page the server
+      // placed it on and working outwards.
+      const order = Array.from(container.querySelectorAll<HTMLElement>('.page'))
+        .sort((a, b) => Math.abs(Number(a.dataset.page) - c.page) - Math.abs(Number(b.dataset.page) - c.page));
+      for (const page of order) {
         const boxes = liveBoxes(page, c.quote);
         if (!boxes) continue;
         const layer = page.querySelector('.hl-layer')!;
@@ -705,13 +714,29 @@ export function PdfView({
     const rawY = last.bottom - scRect.top + scroller.scrollTop + 6;
     const x = Math.max(scroller.scrollLeft + 8, Math.min(rawX, scroller.scrollLeft + scroller.clientWidth - 316));
     const y = Math.min(rawY, scroller.scrollTop + scroller.clientHeight - 40);
-    setDraft({ page: Number(pageEl.dataset.page), quote: quote.slice(0, 600), rects, x, y });
+    // The page text either side of the selection: what tells this passage apart
+    // from the same words elsewhere once pages move (see src/preview/reanchor.ts).
+    let prefix = '', suffix = '';
+    const layer = pageEl.querySelector('.textLayer');
+    if (layer?.contains(range.startContainer) && layer.contains(range.endContainer)) {
+      const before = document.createRange();
+      before.setStart(layer, 0);
+      before.setEnd(range.startContainer, range.startOffset);
+      const after = document.createRange();
+      after.setStart(range.endContainer, range.endOffset);
+      after.setEnd(layer, layer.childNodes.length);
+      prefix = before.toString().slice(-CONTEXT_CHARS);
+      suffix = after.toString().slice(0, CONTEXT_CHARS);
+    }
+    setDraft({ page: Number(pageEl.dataset.page), quote: quote.slice(0, 600), rects, x, y, prefix, suffix });
     setDraftText('');
   };
 
   const submitDraft = async () => {
     if (!draft || !draftText.trim()) return;
-    await createComment({ page: draft.page, quote: draft.quote, rects: draft.rects, text: draftText.trim() });
+    await createComment({
+      page: draft.page, quote: draft.quote, rects: draft.rects, text: draftText.trim(), prefix: draft.prefix, suffix: draft.suffix,
+    });
     setDraft(null);
     window.getSelection()?.removeAllRanges();
   };

@@ -46,6 +46,9 @@ export function CommentsPanel({
       <div className="comment-quote">
         {c.role && c.role !== 'human' && <span className={`role-badge role-${c.role}`}>{c.role}</span>}
         p.{c.page} · “{c.quote.slice(0, 90)}{c.quote.length > 90 ? '…' : ''}”
+        {c.stale && c.status !== 'resolved' && (
+          <span className="stale-badge" title="This passage is no longer in the PDF — it was probably edited.">passage not found</span>
+        )}
       </div>
       <div className="comment-text">{c.text}</div>
       {c.replies?.map((r, i) => (

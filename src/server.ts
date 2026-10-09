@@ -14,6 +14,7 @@ import { LIST_CHECKPOINTS_NAME, listCheckpointsConfig } from './tools/listCheckp
 import { CHECK_COMMENTS_NAME, checkCommentsConfig, RESOLVE_COMMENT_NAME, resolveCommentConfig, ADD_COMMENT_NAME, addCommentConfig, REPLY_COMMENT_NAME, replyCommentConfig } from './tools/commentsToolDefs.js';
 import { listComments, updateComment, addComment, addReply } from './preview/commentsStore.js';
 import { findAnchor } from './preview/anchorMatch.js';
+import { latestPageTexts, reanchorToLatest } from './preview/pdfPages.js';
 import { getPreview, peekPreview, captureDiff, shutdownEngine } from './engine/browserHost.js';
 import { setConfig, requestCompile } from './coordinator.js';
 import { setProjectRoot } from './session.js';
@@ -195,17 +196,20 @@ server.registerTool(CHECK_COMMENTS_NAME, checkCommentsConfig, async ({ includeRe
   const resolved = all.filter((c) => c.status === 'resolved');
   const suggested = all.filter((c) => c.status === 'suggested');
   // Each accepted comment becomes a located work item: the quoted passage, the
-  // instruction, and the source file:line it anchors to (best-effort text match).
+  // instruction, and the source file:line it anchors to (best-effort text match,
+  // told apart by the comment's page when the quote appears more than once).
+  const pages = accepted.length ? await latestPageTexts() : null;
   const fmtLocated = async (c: (typeof all)[number]) => {
-    const anchor = await findAnchor(projectRoot, c.quote);
+    const anchor = await findAnchor(projectRoot, c.quote, { prefix: c.prefix, suffix: c.suffix, pageText: pages?.[c.page - 1] });
     const loc = anchor
       ? `\n  ↳ source: ${anchor.file}:${anchor.line}`
       : '\n  ↳ source: not located — search the files for the quoted text';
+    const stale = c.stale ? ' (passage no longer in the PDF — it may already have been edited)' : '';
     const who = c.role && c.role !== 'human' ? ` (${c.role})` : '';
     const thread = c.replies?.length
       ? '\n  ' + c.replies.map((r) => `↪ ${r.by}: ${r.text}`).join('\n  ')
       : '';
-    return `[id: ${c.id}]${who} p.${c.page} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"${loc}\n  → ${c.text}${thread}`;
+    return `[id: ${c.id}]${who} p.${c.page}${stale} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"${loc}\n  → ${c.text}${thread}`;
   };
   const fmtPlain = (c: (typeof all)[number]) =>
     `[id: ${c.id}] p.${c.page} — "${c.quote.slice(0, 160)}${c.quote.length > 160 ? '…' : ''}"\n  → ${c.text}`;
@@ -249,6 +253,9 @@ server.registerTool(ADD_COMMENT_NAME, addCommentConfig, async ({ quote, comment,
     role: role ?? 'reviewer',
     status: accepted ? 'accepted' : 'suggested',
   });
+  // Put it on the page its quote is actually on (the agent's `page` is a hint,
+  // 1 by default), and give it the context that keeps it there.
+  await reanchorToLatest(projectRoot).catch(() => false);
   try { peekPreview()?.broadcast({ type: 'comments-changed' }); } catch { /* no viewer */ }
   const where = accepted
     ? 'It is actionable now (autonomous mode).'

@@ -57,3 +57,30 @@ test('locates a quote that crosses a hard-wrapped line or a hyphenated word', as
     assert.equal(b!.line, 4);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
+
+test('a short quote found in several files is told apart by its page', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'am-'));
+  try {
+    writeFileSync(join(d, 'main.tex'), '\\documentclass{beamer}\n\\begin{document}\n\\input{boucles}\n\\input{portee}\n\\end{document}\n');
+    writeFileSync(join(d, 'boucles.tex'), '\\begin{frame}{Boucles}\n\\myemph{Réécrite, puis partagée}\nUn indice entier.\n\\end{frame}\n');
+    writeFileSync(join(d, 'portee.tex'), [
+      '\\begin{frame}{Portée des variables : privée ou partagée}',
+      '\\begin{block}{Privée}',
+      '\\item Une \\myemph{copie par thread}',
+      '\\end{block}',
+      '\\begin{block}{Partagée}',
+      '\\item Une seule variable, vue de \\myemph{tous}',
+      '\\end{block}',
+      '\\end{frame}',
+    ].join('\n'));
+    // Without context: whichever file comes first.
+    assert.equal((await findAnchor(d, 'Partagée'))!.file, 'boucles.tex');
+    // With the page it is on: the scope slide.
+    const pageText = 'Portée des variables : privée ou partagéePrivéeUne copie par threadPartagéeUne seule variable, vue de tous';
+    const onPage = await findAnchor(d, 'Partagée', { pageText });
+    assert.equal(onPage!.file, 'portee.tex');
+    // And the prefix/suffix pick the block title, not the frame title.
+    const exact = await findAnchor(d, 'Partagée', { pageText, prefix: 'Une copie par thread', suffix: 'Une seule variable' });
+    assert.deepEqual([exact!.file, exact!.line], ['portee.tex', 5]);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});

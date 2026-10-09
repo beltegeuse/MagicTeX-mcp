@@ -1,6 +1,8 @@
 // LiquidText-style anchored comments, stored per-project in
-// .latex-preview/comments.json. The anchor is a page number + the quoted text +
-// its bounding rects at scale 1, so highlights re-project at any zoom. The dir
+// .latex-preview/comments.json. The anchor is the quoted text + a little of the
+// page text around it; the page number and the bounding rects (at scale 1, so
+// highlights re-project at any zoom) are a cache of where that text was last
+// found, refreshed after every compile (see reanchor.ts). The dir
 // is already ignored by the file watcher and the project collector, so comment
 // writes never trigger recompiles or end up in export zips.
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
@@ -36,6 +38,11 @@ export interface Comment {
   created: string;
   resolvedNote?: string;
   resolvedAt?: string;
+  /** Page text just before / after the quote, to tell repeated passages apart. */
+  prefix?: string;
+  suffix?: string;
+  /** The quote was not found in the latest PDF: `page` is where it last was. */
+  stale?: boolean;
 }
 
 const FILE = 'comments.json';
@@ -105,6 +112,8 @@ export async function listComments(root: string): Promise<Comment[]> {
     if ((c.status as string) === 'pending') c.status = 'accepted'; // pre-rename files
     if (!Array.isArray(c.rects)) c.rects = [];
     if (!Array.isArray(c.replies)) c.replies = [];
+    if (typeof c.prefix !== 'string') delete c.prefix;
+    if (typeof c.suffix !== 'string') delete c.suffix;
   }
   return parsed as Comment[];
 }
@@ -125,7 +134,10 @@ async function save(root: string, comments: Comment[]): Promise<void> {
 
 export async function addComment(
   root: string,
-  input: { page: number; quote: string; rects: CommentRect[]; text: string; role?: CommentRole; status?: CommentStatus },
+  input: {
+    page: number; quote: string; rects: CommentRect[]; text: string; role?: CommentRole; status?: CommentStatus;
+    prefix?: string; suffix?: string;
+  },
 ): Promise<Comment> {
   const comment: Comment = {
     id: randomBytes(6).toString('hex'),
@@ -142,6 +154,9 @@ export async function addComment(
     replies: [],
     created: new Date().toISOString(),
   };
+  // Context is optional: an agent's comment gets it on its first re-anchoring.
+  if (typeof input.prefix === 'string') comment.prefix = input.prefix.slice(-200);
+  if (typeof input.suffix === 'string') comment.suffix = input.suffix.slice(0, 200);
   // The whole read -> mutate -> write runs as one cross-process critical
   // section, so two agents adding/resolving/replying to comments at the same
   // moment queue instead of one silently overwriting the other's change.
@@ -186,6 +201,36 @@ export async function addReply(
     (c.replies ??= []).push({ by: reply.by, text: String(reply.text).slice(0, 2000), at: new Date().toISOString() });
     await save(root, all);
     return c;
+  });
+}
+
+/** Where a comment now is, as reanchorComments' callback reports it. */
+export type AnchorUpdate = Partial<Pick<Comment, 'page' | 'rects' | 'prefix' | 'suffix' | 'stale'>>;
+
+/**
+ * Re-place every comment against a new PDF. `place` returns the fields that
+ * changed for a comment (or null to leave it alone); a `stale: false` clears
+ * the flag. Writes only if something actually changed, so a recompile that
+ * moved nothing doesn't touch the file. Resolves to whether it did.
+ */
+export async function reanchorComments(root: string, place: (c: Comment) => AnchorUpdate | null): Promise<boolean> {
+  return withLock(root, async () => {
+    const all = await listComments(root);
+    let changed = false;
+    for (const c of all) {
+      const u = place(c);
+      if (!u) continue;
+      if (u.page !== undefined && u.page !== c.page) { c.page = u.page; changed = true; }
+      if (u.rects !== undefined && JSON.stringify(u.rects) !== JSON.stringify(c.rects)) { c.rects = u.rects; changed = true; }
+      if (u.prefix !== undefined && u.prefix !== c.prefix) { c.prefix = u.prefix; changed = true; }
+      if (u.suffix !== undefined && u.suffix !== c.suffix) { c.suffix = u.suffix; changed = true; }
+      if (u.stale !== undefined && u.stale !== !!c.stale) {
+        if (u.stale) c.stale = true; else delete c.stale;
+        changed = true;
+      }
+    }
+    if (changed) await save(root, all);
+    return changed;
   });
 }
 

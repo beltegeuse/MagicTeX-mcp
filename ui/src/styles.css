@@ -265,6 +265,8 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .role-defender { background: #4a3420; color: #f0b878; }
 .role-author { background: #16351f; color: #7ee29a; }
 .role-human { background: #24344f; color: #9cc0ff; }
+.stale-badge { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px;
+               font-size: 10px; background: #4a2626; color: #f0a0a0; }
 .reply { margin: 4px 0 0 4px; padding: 3px 0; color: #cbd3dd; font-size: 12px; border-left: 2px solid #333; padding-left: 8px; }
 .reply-box { display: flex; gap: 4px; margin-top: 6px; }
 .reply-box input { flex: 1 1 auto; min-width: 0; background: #1e1f22; color: #ddd; border: 1px solid #45484e;
