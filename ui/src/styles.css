@@ -109,11 +109,32 @@ body.resizing .pdf-scroll, body.resizing .editor-scroll { pointer-events: none; 
 .page canvas { display: block; }
 
 /* pdf.js text layer: invisible glyphs positioned over the canvas so text is
-   selectable; selection stays visible. */
+   selectable; selection stays visible.
+   pdf.js only POSITIONS each span; its size comes from CSS variables it sets
+   (--font-height, --scale-x, --min-font-size) that do nothing without the rules
+   from pdfjs-dist/web/pdf_viewer.css, reproduced here. Without them every span
+   was the browser's default 13px serif/monospace, unstretched: wider or
+   narrower than the glyphs on the canvas, so a drag-selection ran ahead of or
+   behind the mouse and a highlight landed off its words. */
+.page { --user-unit: 1; --total-scale-factor: calc(var(--scale-factor) * var(--user-unit));
+        --scale-round-x: 1px; --scale-round-y: 1px; }
 .textLayer { position: absolute; inset: 0; overflow: hidden; line-height: 1;
-             forced-color-adjust: none; }
+             letter-spacing: normal; word-spacing: normal; text-size-adjust: none;
+             forced-color-adjust: none;
+             --min-font-size: 1;
+             --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+             --min-font-size-inv: calc(1 / var(--min-font-size)); }
 .textLayer span, .textLayer br { color: transparent; position: absolute; white-space: pre;
                                  cursor: text; transform-origin: 0% 0%; }
+.textLayer > :not(.markedContent), .textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.textLayer .markedContent { display: contents; }
 .textLayer ::selection { background: rgba(45, 108, 223, .35); }
 
 /* Anchored comment highlights */

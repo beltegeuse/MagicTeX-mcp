@@ -36,3 +36,24 @@ test('returns null for a quote that is not there', async () => {
     assert.equal(await findAnchor(d, 'nonexistent passage zzz qqq wibble'), null);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
+
+test('locates a French quote whatever the accent spelling in the source', async () => {
+  const d = project("\\documentclass{article}\n\\begin{document}\nNous pr\\'esentons une m\\'ethode g\\'en\\'erale.\n\\end{document}\n");
+  try {
+    const a = await findAnchor(d, 'présentons une méthode générale');
+    assert.ok(a);
+    assert.equal(a!.line, 3);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('locates a quote that crosses a hard-wrapped line or a hyphenated word', async () => {
+  const d = project('\\documentclass{article}\n\\begin{document}\nWe propose a new estimator that\nreduces variance with no highlighting bias.\n\\end{document}\n');
+  try {
+    const a = await findAnchor(d, 'new estimator that reduces variance');
+    assert.ok(a);
+    assert.equal(a!.line, 3);
+    const b = await findAnchor(d, 'variance with no high-\nlighting bias');
+    assert.ok(b);
+    assert.equal(b!.line, 4);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});

@@ -84,6 +84,12 @@ jobs:
       - name: Highlights stay on their words at every zoom
         run: node scripts/smoke-highlight-zoom.mjs
 
+      # Matching used to be ASCII-only: an accented letter was a word break, so
+      # French highlights lost their first/last letter, and a quote across a
+      # hyphenated line break showed no highlight at all.
+      - name: Highlights land on accented and hyphenated text
+        run: node scripts/smoke-highlight-accents.mjs
+
       # The % label moving while the pages stay put reads as "zoom is broken".
       # It did, three ways: zoom re-downloaded the PDF (dead once the server
       # stopped), Ctrl+wheel zoomed the browser instead, and a page wider than

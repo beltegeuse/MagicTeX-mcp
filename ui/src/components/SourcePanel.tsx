@@ -14,7 +14,7 @@ import { EditorView, keymap } from '@codemirror/view';
 import { EditorSelection, Prec } from '@codemirror/state';
 import { undo, redo } from '@codemirror/commands';
 import { latex } from 'codemirror-lang-latex';
-import { normalize, phrase, stripLatex } from '../sync';
+import { fold, foldSource, locateAcross, stripLatex, type FoldedSource } from '../sync';
 import { visualMode } from '../visual';
 import { FileTree } from './FileTree';
 import { saveFile, type Status } from '../api';
@@ -68,6 +68,9 @@ export function SourcePanel({
   const autoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cmRef = useRef<ReactCodeMirrorRef>(null);
   const cache = useRef<Map<string, string>>(new Map());
+  // Folded form of each cached file for PDF → source sync, redone only when
+  // the file's text changes.
+  const folded = useRef<Map<string, { text: string; src: FoldedSource }>>(new Map());
   // Unsaved text for files that are not currently open. The three data-loss bugs
   // in this file all came from the same gap: nothing tracked which text belonged
   // to which file, so a buffer could be discarded on a switch, or applied to the
@@ -293,9 +296,10 @@ export function SourcePanel({
   // PDF → source: find the file+line whose prose matches, open it, jump there.
   useEffect(() => {
     if (!syncTarget) return;
-    const target = phrase(syncTarget.text, 6);
-    if (!target) return;
     (async () => {
+      // Every file, not the first that matches at all: a long phrase in a later
+      // file beats a short one in an earlier file (locateAcross).
+      const sources: [string, FoldedSource][] = [];
       for (const f of files) {
         if (!cache.current.has(f)) {
           try {
@@ -303,17 +307,16 @@ export function SourcePanel({
             if (r.ok) cache.current.set(f, await r.text());
           } catch { /* ignore */ }
         }
-        const lines = (cache.current.get(f) ?? '').split('\n');
-        for (let i = 0; i < lines.length; i++) {
-          const src = normalize(stripLatex(lines[i]));
-          if (src.length < 4) continue;
-          if (src.includes(target) || (target.includes(src) && src.length > 10)) {
-            if (f === activeRef.current) jumpToLine(i);
-            else { pendingJumpLine.current = i; void openFile(f); }
-            return;
-          }
-        }
+        const text = cache.current.get(f);
+        if (text === undefined) continue;
+        let entry = folded.current.get(f);
+        if (entry?.text !== text) folded.current.set(f, entry = { text, src: foldSource(text) });
+        sources.push([f, entry.src]);
       }
+      const hit = locateAcross(sources, syncTarget.text);
+      if (!hit) return;
+      if (hit.key === activeRef.current) jumpToLine(hit.line);
+      else { pendingJumpLine.current = hit.line; void openFile(hit.key); }
     })();
   }, [syncTarget, files, openFile, jumpToLine]);
 
@@ -342,8 +345,8 @@ export function SourcePanel({
     const view = cmRef.current?.view;
     if (!view || !onSyncToPdf) return;
     const line = view.state.doc.lineAt(view.state.selection.main.head);
-    const prose = phrase(stripLatex(line.text), 8);
-    if (prose.split(' ').filter(Boolean).length >= 2) onSyncToPdf(line.text);
+    // Only lines with some prose on them (~2 words); a bare command has none.
+    if (fold(stripLatex(line.text)).text.length >= 8) onSyncToPdf(line.text);
   }, [onSyncToPdf]);
 
   useEffect(() => { localStorage.setItem('ws-visual', visual ? '1' : '0'); }, [visual]);

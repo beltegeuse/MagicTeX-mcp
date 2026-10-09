@@ -8,7 +8,7 @@ import '../mathSumPrecise'; // must precede pdfjs — see the file for why
 import * as pdfjs from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { createComment, type Comment } from '../api';
-import { normalize, phrase } from '../sync';
+import { fold, findHead, findInFolded, stripLatex } from '../sync';
 import { groupLines, columnsFromTextItems } from '../lines';
 
 // Our own worker module: it installs the Math.sumPrecise polyfill into the
@@ -60,6 +60,10 @@ const WHEEL_SETTLE_MS = 150;
 
 /** The scale a `.page` was drawn at, as the renderer recorded it on the page. */
 const pageScale = (el: HTMLElement) => parseFloat(el.style.getPropertyValue('--scale-factor')) || 1;
+// A page's text-layer spans in reading order — only the ones holding text, so a
+// marked-content wrapper span doesn't count its children's text a second time.
+const textSpans = (page: Element) =>
+  (Array.from(page.querySelectorAll('.textLayer span')) as HTMLElement[]).filter((s) => !s.firstElementChild);
 
 interface Draft { page: number; quote: string; rects: { x: number; y: number; w: number; h: number }[]; x: number; y: number }
 interface SyncTarget { text: string; nonce: number }
@@ -240,6 +244,8 @@ export function PdfView({
         wrap.style.width = `${vp.width}px`;
         wrap.style.height = `${vp.height}px`;
         wrap.style.setProperty('--scale-factor', String(renderScale));
+        // The text layer's CSS sizes spans by scale × user unit, as the canvas is.
+        wrap.style.setProperty('--user-unit', String(vp.userUnit ?? 1));
         const canvas = document.createElement('canvas');
         canvas.width = vp.width;
         canvas.height = vp.height;
@@ -453,36 +459,42 @@ export function PdfView({
     if (!span || !onSyncToSource) return;
     let text = span.textContent ?? '';
     let n = span.nextElementSibling;
-    while (n && normalize(text).split(' ').filter(Boolean).length < 6) {
+    while (n && fold(text).text.length < 48) { // ~8 words: enough to be distinctive
       text += ' ' + (n.textContent ?? '');
       n = n.nextElementSibling;
     }
-    if (normalize(text)) onSyncToSource(text);
+    if (fold(text).text) onSyncToSource(text);
   };
 
   // ── Source → PDF: scroll the matching page/word into view and flash it ──
   useEffect(() => {
     const container = pagesRef.current;
     if (!container || !syncTarget) return;
-    const target = phrase(syncTarget.text, 6);
-    if (!target) return;
-    for (const page of container.querySelectorAll('.page')) {
-      const spans = Array.from(page.querySelectorAll('.textLayer span')) as HTMLElement[];
+    // The source side sends a raw LaTeX line; compare only the prose it prints.
+    const target = fold(stripLatex(syncTarget.text)).text;
+    if (target.length < 4) return;
+    const pages = Array.from(container.querySelectorAll('.page')).map((page) => {
       let concat = '';
-      const map: { start: number; el: HTMLElement }[] = [];
-      for (const s of spans) {
-        const norm = normalize(s.textContent ?? '');
-        if (!norm) continue;
-        map.push({ start: concat.length, el: s });
-        concat += norm + ' ';
+      const owner: HTMLElement[] = []; // span of each folded character
+      for (const s of textSpans(page)) {
+        const f = fold(s.textContent ?? '').text;
+        concat += f;
+        for (let k = 0; k < f.length; k++) owner.push(s);
       }
-      const at = concat.indexOf(target);
-      if (at < 0) continue;
-      const hit = [...map].reverse().find((m) => m.start <= at)?.el ?? spans[0];
-      hit.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      hit.classList.add('sync-flash');
-      setTimeout(() => hit.classList.remove('sync-flash'), 1400);
-      break;
+      return { concat, owner };
+    });
+    // A long phrase on any page first, so a shorter one that also opens an
+    // earlier paragraph (an abstract echoing the intro) doesn't win.
+    for (const min of [48, 20]) {
+      for (const { concat, owner } of pages) {
+        const at = findHead(concat, target, 0, min);
+        if (at < 0) continue;
+        const hit = owner[at];
+        hit.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        hit.classList.add('sync-flash');
+        setTimeout(() => hit.classList.remove('sync-flash'), 1400);
+        return;
+      }
     }
   }, [syncTarget]);
 
@@ -517,42 +529,23 @@ export function PdfView({
 
     // Re-anchor a quote onto a page's *live* text layer, returning boxes at the
     // current glyph positions — so a highlight follows the text through
-    // recompiles/reflows instead of sitting at frozen coordinates. We anchor by a
-    // head phrase and a tail phrase (not the whole quote), and try progressively
-    // shorter phrases (8→3 words) so it still lands when the AI rewrote words near
-    // an edge; only if even a 3-word head is gone do we give up (→ null) and let
-    // the caller fall back to the stored rects.
-    const anchor = (concat: string, words: string[], fromStart: boolean): number => {
-      for (const n of [8, 6, 4, 3]) {
-        const ph = (fromStart ? words.slice(0, n) : words.slice(-n)).join(' ');
-        if (words.length < n && n > 3) continue; // don't retry the same whole-string phrase
-        const idx = fromStart ? concat.indexOf(ph) : concat.lastIndexOf(ph);
-        if (idx >= 0) return fromStart ? idx : idx + ph.length;
-      }
-      return -1;
-    };
-    interface Span { start: number; len: number; l: number; t: number; w: number; h: number; el: HTMLElement }
+    // recompiles/reflows instead of sitting at frozen coordinates. Matching is on
+    // folded letters (see ../sync): findInFolded anchors by a head and a tail
+    // phrase (not the whole quote), trying progressively shorter ones so it still
+    // lands when the AI rewrote words near an edge; only if even the shortest
+    // head is gone do we give up (→ null) and let the caller fall back to the
+    // stored rects.
+    //
+    // A span's `start`/`len` are in the page's folded text; `map` takes each of
+    // its folded characters back to an index in the span's own raw text.
+    interface Span { start: number; len: number; l: number; t: number; w: number; h: number; el: HTMLElement; map: number[] }
 
-    // Map each character of normalize()'d text back to its index in the raw
-    // text, mirroring what normalize does: alphanumerics stand for themselves,
-    // each run of everything else collapses to ONE space (indexed at the run's
-    // first character), and leading/trailing runs vanish to the trim().
-    const normToRaw = (raw: string): number[] => {
-      const map: number[] = [];
-      let inSep = true; // a leading separator run is trimmed away
-      for (let i = 0; i < raw.length; i++) {
-        if (/[a-z0-9]/.test(raw[i].toLowerCase())) { map.push(i); inSep = false; }
-        else if (!inSep) { map.push(i); inSep = true; }
-      }
-      if (inSep) map.pop(); // the trailing space trim() removes
-      return map;
-    };
-
-    // Where inside a span does normalized offset `localNorm` actually fall?
+    // Where inside a span does folded character `k` actually fall?
     // hits() works at span granularity, but pdf.js emits spans covering many
     // words at once, so taking a span's own edge put the highlight's start up to
     // a whole span early. A Range over the text node gives the true glyph
-    // position.
+    // position. 'left' is the left edge of character k; 'right' is the right
+    // edge of character k, including any combining accent drawn over it.
     //
     // Everything here is measured in the page's VISUAL space — client rects,
     // minus the page's own origin. It used to mix spaces: offsetWidth for the
@@ -562,12 +555,16 @@ export function PdfView({
     // every span was as wide as its layout box rather than as wide as its
     // glyphs. k is recomputed at each zoom level, which is why the highlights
     // moved when you changed zoom rather than being consistently wrong.
-    const edgeInSpan = (s: Span, localNorm: number, side: 'left' | 'right', pageLeft: number): number | null => {
+    const edgeInSpan = (s: Span, k: number, side: 'left' | 'right', pageLeft: number): number | null => {
       const node = s.el.firstChild;
       if (!node || node.nodeType !== Node.TEXT_NODE) return null;
       const raw = node.textContent ?? '';
-      const map = normToRaw(raw);
-      const rawIdx = localNorm <= 0 ? 0 : localNorm >= map.length ? raw.length : map[localNorm];
+      let rawIdx = s.map[k];
+      if (rawIdx === undefined) return null;
+      if (side === 'right') {
+        rawIdx += (raw.codePointAt(rawIdx) ?? 0) > 0xffff ? 2 : 1;
+        while (rawIdx < raw.length && /\p{M}/u.test(raw[rawIdx])) rawIdx++;
+      }
       if (side === 'left' ? rawIdx >= raw.length : rawIdx <= 0) return null;
       const range = document.createRange();
       if (side === 'left') { range.setStart(node, rawIdx); range.setEnd(node, raw.length); }
@@ -576,15 +573,12 @@ export function PdfView({
       if (!rect.width) return null;
       return (side === 'left' ? rect.left : rect.right) - pageLeft;
     };
-    // groupLines lives in ../lines: knowing each line's FULL extent (not just the
-    // matched words on it) is what lets interior lines get a flush box below, and
-    // that same property is what made a two-column page paint across the gutter
-    // until the grouping learned about columns. Extracted so the geometry can be
-    // unit-tested with synthetic coordinates.
-    const liveBoxes = (page: Element, quote: string): { l: number; t: number; w: number; h: number }[] | null => {
-      const norm = normalize(quote);
-      if (!norm) return null;
-      const words = norm.split(' ').filter(Boolean);
+    // A page's folded text and its spans, built once per pass: every comment
+    // (and, for agent comments, every page) is matched against it.
+    const pageTexts = new Map<Element, { concat: string; all: Span[]; pageBox: DOMRect }>();
+    const pageText = (page: Element) => {
+      const cached = pageTexts.get(page);
+      if (cached) return cached;
       let concat = '';
       const all: Span[] = [];
       // Client rects, not offsets: pdf.js scales each span with a transform that
@@ -593,26 +587,39 @@ export function PdfView({
       // subtracting its origin lands in exactly the coordinate space `.hl-layer`
       // (inset: 0) positions boxes in.
       const pageBox = page.getBoundingClientRect();
-      for (const s of page.querySelectorAll('.textLayer span')) {
-        const el = s as HTMLElement;
-        const n = normalize(el.textContent ?? '');
-        if (!n) continue;
+      // Spans are joined with nothing between them: folded text has no spaces,
+      // so a word pdf.js split over two spans reads back as one word.
+      for (const el of textSpans(page)) {
+        const f = fold(el.textContent ?? '');
+        if (!f.text) continue;
         const r = el.getBoundingClientRect();
         all.push({
-          start: concat.length, len: n.length,
+          start: concat.length, len: f.text.length,
           l: r.left - pageBox.left, t: r.top - pageBox.top, w: r.width, h: r.height,
-          el,
+          el, map: f.map,
         });
-        concat += n + ' ';
+        concat += f.text;
       }
+      const built = { concat, all, pageBox };
+      pageTexts.set(page, built);
+      return built;
+    };
+    // groupLines lives in ../lines: knowing each line's FULL extent (not just the
+    // matched words on it) is what lets interior lines get a flush box below, and
+    // that same property is what made a two-column page paint across the gutter
+    // until the grouping learned about columns. Extracted so the geometry can be
+    // unit-tested with synthetic coordinates.
+    const liveBoxes = (page: Element, quote: string): { l: number; t: number; w: number; h: number }[] | null => {
+      const needle = fold(quote).text;
+      if (!needle) return null;
+      const { concat, all, pageBox } = pageText(page);
       // Stored at scale 1 by the renderer; project to what is on screen now.
       const cols: number[] = (() => {
         try { return JSON.parse((page as HTMLElement).dataset.columns ?? '[]') as number[]; } catch { return []; }
       })().map((x) => x * (parseFloat(getComputedStyle(page).getPropertyValue('--scale-factor')) || 1));
-      const at = anchor(concat, words, true);
-      if (at < 0) return null;
-      const tailEnd = anchor(concat, words, false);
-      const end = tailEnd > at ? tailEnd : Math.min(concat.length, at + norm.length);
+      const match = findInFolded(concat, needle);
+      if (!match) return null;
+      const { start: at, end } = match;
       const hits = (line: { spans: Span[] }) => line.spans.filter((s) => s.start < end && s.start + s.len > at);
 
       // Shape it like a text selection: the first touched line starts at the
@@ -626,15 +633,14 @@ export function PdfView({
       return touched.map((L, i) => {
         let l = L.l, r = L.r;
         if (i === 0) {
-          // Prefer the exact glyph position of the matched word; fall back to
-          // the span edge when the offset lands in the gap between two spans or
-          // the node isn't measurable.
+          // Prefer the exact glyph position of the matched letter; fall back to
+          // the span edge when the node isn't measurable.
           const host = hits(L).find((s) => s.start <= at && at < s.start + s.len);
           l = (host && edgeInSpan(host, at - host.start, 'left', pageBox.left)) ?? Math.min(...hits(L).map((s) => s.l));
         }
         if (i === touched.length - 1) {
           const host = hits(L).find((s) => s.start < end && end <= s.start + s.len);
-          r = (host && edgeInSpan(host, end - host.start, 'right', pageBox.left)) ?? Math.max(...hits(L).map((s) => s.l + s.w));
+          r = (host && edgeInSpan(host, end - 1 - host.start, 'right', pageBox.left)) ?? Math.max(...hits(L).map((s) => s.l + s.w));
         }
         return { l, t: L.t, w: r - l, h: L.b - L.t };
       });
