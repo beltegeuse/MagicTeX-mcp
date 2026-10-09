@@ -6,7 +6,7 @@
 // covered this way and remain unsupported.
 import { readdir, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import type { EngineFile } from './browserHost.js';
 
 const DIR = fileURLToPath(new URL('../../assets/fallback-styles', import.meta.url));
@@ -27,4 +27,19 @@ export async function getFallbackStyles(): Promise<EngineFile[]> {
     cache = [];
   }
   return cache;
+}
+
+/**
+ * The fallbacks a compile of `mainRel` needs, placed next to it. busytex runs
+ * TeX from the main file's directory with no TEXINPUTS, so a .sty at the project
+ * root — ours or the project's own — is invisible to a document in a
+ * subdirectory. Only a copy the project ships in that same directory counts as
+ * already present; it always wins over ours.
+ */
+export function placeFallbacks(fallbacks: EngineFile[], files: EngineFile[], mainRel: string): EngineFile[] {
+  const mainDir = posix.dirname(mainRel);
+  const present = new Set(files.filter((f) => posix.dirname(f.path) === mainDir).map((f) => posix.basename(f.path)));
+  return fallbacks
+    .filter((f) => !present.has(f.path))
+    .map((f) => ({ ...f, path: posix.join(mainDir, f.path) }));
 }

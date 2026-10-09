@@ -1,6 +1,8 @@
 // Turn a raw TeX/busytex log into structured errors so render_preview can hand
 // Claude something it can act on directly ({file, line, message}) instead of a
 // wall of log text.
+import { posix } from 'node:path';
+
 export interface TexError {
   file?: string;
   line?: number;
@@ -14,7 +16,15 @@ const BANG = /^!\s+(.*)$/;
 // "l.42 \something" — the line number TeX reports for the current error.
 const L_LINE = /^l\.(\d+)\b/;
 
-export function parseTexLog(log: string): TexError[] {
+/**
+ * `baseDir` is the main file's directory relative to the project root. TeX runs
+ * from there, so the paths it prints are relative to it; joining them back onto
+ * it reports `chapters/intro.tex` rather than an `intro.tex` the reader has to
+ * go looking for.
+ */
+export function parseTexLog(log: string, baseDir?: string): TexError[] {
+  const rebase = (file: string) =>
+    baseDir && baseDir !== '.' && !posix.isAbsolute(file) ? posix.join(baseDir, file) : file;
   const lines = log.split(/\r?\n/);
   const errors: TexError[] = [];
 
@@ -23,7 +33,7 @@ export function parseTexLog(log: string): TexError[] {
 
     const fl = line.match(FILE_LINE);
     if (fl) {
-      errors.push({ file: fl[1], line: Number(fl[2]), message: fl[3].trim() });
+      errors.push({ file: rebase(fl[1]), line: Number(fl[2]), message: fl[3].trim() });
       continue;
     }
 
@@ -48,8 +58,8 @@ export function parseTexLog(log: string): TexError[] {
 }
 
 /** Compact, model-friendly summary. Falls back to the log tail if unparseable. */
-export function summarizeErrors(log: string): string {
-  const errors = parseTexLog(log);
+export function summarizeErrors(log: string, baseDir?: string): string {
+  const errors = parseTexLog(log, baseDir);
   if (errors.length === 0) {
     const tail = log.slice(-1500).trim();
     return tail ? `No structured errors parsed. Log tail:\n${tail}` : 'Compile failed with no log output.';
