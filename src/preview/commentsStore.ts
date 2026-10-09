@@ -122,6 +122,10 @@ export async function listComments(root: string): Promise<Comment[]> {
   for (const c of parsed as Comment[]) {
     if (!c) continue;
     if ((c.status as string) === 'pending') c.status = 'accepted'; // pre-rename files
+    // Everything that reads a comment folds its quote and does arithmetic on its
+    // page; one hand-edited `"quote": null` used to stop re-anchoring for all.
+    if (typeof c.quote !== 'string') c.quote = c.quote == null ? '' : String(c.quote);
+    if (!Number.isInteger(c.page) || c.page < 1) c.page = Math.max(1, Math.floor(Number(c.page)) || 1);
     if (!Array.isArray(c.rects)) c.rects = [];
     if (!Array.isArray(c.replies)) c.replies = [];
     if (typeof c.prefix !== 'string') delete c.prefix;
@@ -230,7 +234,13 @@ export async function reanchorComments(root: string, place: (c: Comment) => Anch
     const all = await listComments(root);
     let changed = false;
     for (const c of all) {
-      const u = place(c);
+      // One comment that can't be placed must not cost every other one its
+      // place: the failure is reported and that comment is left as it was.
+      let u: AnchorUpdate | null;
+      try { u = place(c); } catch (e) {
+        console.error(`[magictex-mcp] could not re-anchor comment ${c.id}: ${e instanceof Error ? e.message : String(e)}`);
+        continue;
+      }
       if (!u) continue;
       if (u.page !== undefined && u.page !== c.page) { c.page = u.page; changed = true; }
       if (u.rects !== undefined && JSON.stringify(u.rects) !== JSON.stringify(c.rects)) { c.rects = u.rects; changed = true; }

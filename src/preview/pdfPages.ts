@@ -5,7 +5,7 @@
 // re-anchoring after a compile, which does so only when there are comments,
 // and check_comments, to tell a comment's source location apart by its page.
 import { listComments, reanchorComments } from './commentsStore.js';
-import { anchorUpdate, foldPages } from './reanchor.js';
+import { anchorUpdate, foldDoc } from './reanchor.js';
 
 let latest: { pdf: Uint8Array; pages?: Promise<string[] | null> } | null = null;
 
@@ -52,11 +52,11 @@ export async function reanchorToLatest(root: string): Promise<boolean> {
   if (!(await listComments(root)).length) return false;
   const pages = await latestPageTexts();
   if (!pages) return false;
-  const folded = foldPages(pages);
+  const doc = foldDoc(pages);
   // No extractable text (Type3 bitmap fonts, fonts without a ToUnicode map):
   // that says nothing about where any passage went.
-  if (!folded.some((t) => t.length)) return false;
-  return reanchorComments(root, (c) => anchorUpdate(folded, pages, c));
+  if (!doc.text.some((t) => t.length)) return false;
+  return reanchorComments(root, (c) => anchorUpdate(doc, c));
 }
 
 // Re-anchorings run one at a time, off the compile chain: a compile publishes
@@ -66,7 +66,12 @@ let pending: Promise<unknown> = Promise.resolve();
 
 /** Queue a re-anchoring; `onChange` runs if it moved any comment. */
 export function scheduleReanchor(root: string, onChange: () => void): void {
-  pending = pending.then(() => reanchorToLatest(root)).then((changed) => { if (changed) onChange(); }, () => {});
+  pending = pending.then(() => reanchorToLatest(root)).then(
+    (changed) => { if (changed) onChange(); },
+    // Never silent: comments that stop following their passage with nothing
+    // said is exactly the bug this exists to prevent.
+    (e) => console.error(`[magictex-mcp] re-anchoring comments failed: ${e instanceof Error ? e.message : String(e)}`),
+  );
 }
 
 /** Resolves once every queued re-anchoring has finished. */

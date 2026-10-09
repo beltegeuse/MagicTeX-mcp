@@ -10,7 +10,7 @@
 //
 // Pure (no Node or DOM APIs) so the choice can be tested on synthetic pages, and
 // shared with the workspace, which highlights the same spot.
-import { fold, findInFolded, commonPrefixLength, commonSuffixLength } from './textMatch.js';
+import { fold, findInFolded, commonPrefixLength, commonSuffixLength, contextScore, type Folded } from './textMatch.js';
 
 /** What a comment remembers of where it was made. */
 export interface QuoteAnchor {
@@ -83,16 +83,23 @@ const SIG_PHRASE = 16;
 /** Fold each page's text once; every comment is matched against the result. */
 export const foldPages = (pages: string[]): string[] => pages.map((p) => fold(p).text);
 
+/**
+ * A PDF's pages, raw and folded, folded once per re-anchoring pass: the
+ * folded-to-raw maps are what cut a comment's context and replacement text out
+ * of the raw page, and re-folding a page per comment repeated the same work.
+ */
+export interface FoldedDoc { raw: string[]; folds: Folded[]; text: string[] }
+
+export function foldDoc(pages: string[]): FoldedDoc {
+  const folds = pages.map((p) => fold(p));
+  return { raw: pages, folds, text: folds.map((f) => f.text) };
+}
+
 interface Hit {
   start: number; end: number; score: number; count: number; by: FoundBy;
   /** Its edges were found a few letters off: they may fall inside a word. */
   rough?: boolean;
 }
-
-/** How well the text around [start, end) matches the remembered context. */
-const contextScore = (text: string, start: number, end: number, pre: string, post: string) =>
-  commonSuffixLength(pre, text.slice(Math.max(0, start - pre.length), start))
-  + commonPrefixLength(post, text.slice(end, end + post.length));
 
 /** The exact occurrence of `needle` whose surroundings match best; `count` is how many there are. */
 function exactOn(text: string, needle: string, pre: string, post: string): Hit | null {
@@ -300,9 +307,8 @@ export function pageSignature(foldedPages: string[], page: number, start: number
  * lines with nothing between them, so "égaux.Chaque" or "PartagéeUne" are two
  * words, not one.
  */
-function rawSpan(rawPage: string, start: number, end: number, rough = false): string {
+function rawSpan(rawPage: string, start: number, end: number, rough = false, f: Folded = fold(rawPage)): string {
   if (end <= start) return '';
-  const f = fold(rawPage);
   let a = f.map[start], b = f.map[end - 1];
   if (a === undefined || b === undefined) return '';
   if (rough) {
@@ -319,8 +325,9 @@ function rawSpan(rawPage: string, start: number, end: number, rough = false): st
  * raw text. Raw rather than folded so comments.json stays readable; matching
  * folds it anyway.
  */
-export function contextAt(rawPage: string, p: Pick<Placement, 'start' | 'end'>): { prefix: string; suffix: string } {
-  const f = fold(rawPage);
+export function contextAt(
+  rawPage: string, p: Pick<Placement, 'start' | 'end'>, f: Folded = fold(rawPage),
+): { prefix: string; suffix: string } {
   const startRaw = f.map[p.start] ?? 0;
   const endRaw = p.end > 0 && f.map[p.end - 1] !== undefined ? f.map[p.end - 1] + 1 : rawPage.length;
   return {
@@ -330,20 +337,21 @@ export function contextAt(rawPage: string, p: Pick<Placement, 'start' | 'end'>):
 }
 
 /**
- * What re-anchoring changes on comment `c`, given the new PDF's pages (raw and
- * folded), or null to leave it alone.
+ * What re-anchoring changes on comment `c`, given the new PDF's pages, or null
+ * to leave it alone.
  */
-export function anchorUpdate(folded: string[], pages: string[], c: AnchoredComment): AnchorUpdate | null {
-  const p = locate(folded, c);
+export function anchorUpdate(doc: FoldedDoc, c: AnchoredComment): AnchorUpdate | null {
+  const p = locate(doc.text, c);
   if (!p) return null; // too short to place
   // An agent's quote that never matched the PDF (copied from the source, say)
   // was never anywhere, so it can't have moved or been edited.
   const wasFound = c.rects.length > 0 || c.prefix !== undefined || c.suffix !== undefined || !!c.pageSig?.length;
-  // Nothing left to go on: the old behaviour — its page, and its boxes.
-  if (p === 'missing') return wasFound ? { stale: true } : null;
+  // Nothing left to go on: the old behaviour — its page, and its boxes. What
+  // once replaced the quote is gone too, so it no longer says what stands there.
+  if (p === 'missing') return wasFound ? { stale: true, current: null } : null;
   if (p.by === 'estimate') {
     if (!wasFound) return null;
-    return p.page === c.page ? { stale: true } : { page: p.page, rects: [], stale: true };
+    return p.page === c.page ? { stale: true, current: null } : { page: p.page, rects: [], stale: true, current: null };
   }
 
   const u: AnchorUpdate = { page: p.page, stale: false };
@@ -351,12 +359,21 @@ export function anchorUpdate(folded: string[], pages: string[], c: AnchoredComme
   if (p.page !== c.page) u.rects = [];
   if (p.by === 'exact') {
     u.current = null;
-    if (!c.pageSig?.length || p.page !== c.page) u.pageSig = pageSignature(folded, p.page, p.start, p.end);
+    // The signature is about the page's words, not its number: a page that only
+    // moved keeps it. It is redone (it scans every page) only when it no longer
+    // describes the page the quote is on.
+    const text = doc.text[p.page - 1];
+    const sig = c.pageSig ?? [];
+    if (sig.filter((ph) => text.includes(ph)).length * 2 < sig.length || !sig.length) {
+      u.pageSig = pageSignature(doc.text, p.page, p.start, p.end);
+    }
     // A comment without context gets it only once its spot is certain.
-    if (c.prefix === undefined && c.suffix === undefined && p.sure) Object.assign(u, contextAt(pages[p.page - 1], p));
+    if (c.prefix === undefined && c.suffix === undefined && p.sure) {
+      Object.assign(u, contextAt(doc.raw[p.page - 1], p, doc.folds[p.page - 1]));
+    }
   } else {
     // Rewritten or deleted — most likely by whoever addressed the comment.
-    u.current = rawSpan(pages[p.page - 1], p.start, p.end, p.rough).slice(0, 600);
+    u.current = rawSpan(doc.raw[p.page - 1], p.start, p.end, p.rough, doc.folds[p.page - 1]).slice(0, 600);
   }
   return u;
 }

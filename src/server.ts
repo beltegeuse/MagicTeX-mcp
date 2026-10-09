@@ -13,7 +13,7 @@ import { SHOW_DIFF_NAME, showDiffConfig } from './tools/showDiffToolDef.js';
 import { LIST_CHECKPOINTS_NAME, listCheckpointsConfig } from './tools/listCheckpointsToolDef.js';
 import { CHECK_COMMENTS_NAME, checkCommentsConfig, RESOLVE_COMMENT_NAME, resolveCommentConfig, ADD_COMMENT_NAME, addCommentConfig, REPLY_COMMENT_NAME, replyCommentConfig } from './tools/commentsToolDefs.js';
 import { listComments, updateComment, addComment, addReply } from './preview/commentsStore.js';
-import { findAnchor } from './preview/anchorMatch.js';
+import { findAnchor, loadSources } from './preview/anchorMatch.js';
 import { latestPageTexts, reanchorToLatest, settleComments } from './preview/pdfPages.js';
 import { getPreview, peekPreview, captureDiff, shutdownEngine } from './engine/browserHost.js';
 import { setConfig, requestCompile } from './coordinator.js';
@@ -201,6 +201,9 @@ server.registerTool(CHECK_COMMENTS_NAME, checkCommentsConfig, async ({ includeRe
   // instruction, and the source file:line it anchors to (best-effort text match,
   // told apart by the comment's page when the quote appears more than once).
   const pages = accepted.length ? await latestPageTexts() : null;
+  // The project's sources, read once for every lookup below (up to three per
+  // comment: its quote, what replaced it, the text after a deletion).
+  const sources = accepted.length ? await loadSources(projectRoot) : null;
   // What became of the passage: rewritten or deleted (usually by addressing the
   // comment), or gone altogether so that the page is only an estimate.
   const fate = (c: (typeof all)[number]) =>
@@ -212,9 +215,10 @@ server.registerTool(CHECK_COMMENTS_NAME, checkCommentsConfig, async ({ includeRe
     const ctx = { prefix: c.prefix, suffix: c.suffix, pageText: pages?.[c.page - 1] };
     // The quote, or once it has been rewritten, what replaced it — or, deleted,
     // the text that followed it.
-    const anchor = await findAnchor(projectRoot, c.quote, ctx)
-      ?? (c.current ? await findAnchor(projectRoot, c.current, ctx) : null)
-      ?? (c.current === '' && c.suffix ? await findAnchor(projectRoot, c.suffix.slice(0, 48), ctx) : null);
+    const anchor = !sources ? null
+      : await findAnchor(sources, c.quote, ctx)
+        ?? (c.current ? await findAnchor(sources, c.current, ctx) : null)
+        ?? (c.current === '' && c.suffix ? await findAnchor(sources, c.suffix.slice(0, 48), ctx) : null);
     const loc = anchor
       ? `\n  ↳ source: ${anchor.file}:${anchor.line}`
       : '\n  ↳ source: not located — search the files for the quoted text';
@@ -269,7 +273,9 @@ server.registerTool(ADD_COMMENT_NAME, addCommentConfig, async ({ quote, comment,
   // Put it on the page its quote is actually on (the agent's `page` is a hint,
   // 1 by default), and give it the context that keeps it there.
   await settleComments();
-  await reanchorToLatest(projectRoot).catch(() => false);
+  await reanchorToLatest(projectRoot).catch((e) => {
+    console.error(`[magictex-mcp] re-anchoring comments failed: ${e instanceof Error ? e.message : String(e)}`);
+  });
   try { peekPreview()?.broadcast({ type: 'comments-changed' }); } catch { /* no viewer */ }
   const where = accepted
     ? 'It is actionable now (autonomous mode).'

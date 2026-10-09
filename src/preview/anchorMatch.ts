@@ -6,9 +6,7 @@
 // lines simply won't match, and the agent falls back to searching for the
 // quote itself.
 import { listTextFiles, readTextFile } from './filesApi.js';
-import {
-  commonPrefixLength, commonSuffixLength, fold, foldSource, locateAllAcross, type FoldedSource, type SourceHit,
-} from './textMatch.js';
+import { contextScore, fold, foldSource, locateAllAcross, type FoldedSource, type SourceHit } from './textMatch.js';
 
 export interface Anchor { file: string; line: number; snippet: string }
 
@@ -49,38 +47,48 @@ function pickHit(hits: SourceHit<string>[], folded: Map<string, FoldedSource>, n
       const around = text.slice(Math.max(0, h.at - reach), h.at + needle.length + reach);
       for (const ph of phrases) if (around.includes(ph)) near++;
     }
-    const score = commonSuffixLength(pre, text.slice(Math.max(0, h.at - pre.length), h.at))
-      + commonPrefixLength(post, text.slice(h.at + needle.length, h.at + needle.length + post.length))
-      + PHRASE * near;
+    const score = contextScore(text, h.at, h.at + needle.length, pre, post) + PHRASE * near;
     if (score > bestScore) { best = h; bestScore = score; }
   }
   return best;
 }
 
-/**
- * Find the source file+line whose prose best matches `quote`, or null. With
- * `ctx`, a quote found in several places is told apart by its page.
- */
-export async function findAnchor(root: string, quote: string, ctx: AnchorContext = {}): Promise<Anchor | null> {
+/** A project's LaTeX sources, read and folded once, for any number of lookups. */
+export interface ProjectSources {
+  contents: Map<string, string>;
+  folded: Map<string, FoldedSource>;
+}
+
+/** Read and fold every .tex/.bib/.cls/.sty file of the project, or null if it can't be listed. */
+export async function loadSources(root: string): Promise<ProjectSources | null> {
   let files: string[];
   try { files = await listTextFiles(root); } catch { return null; }
-  const texish = files.filter((f) => /\.(tex|bib|cls|sty)$/i.test(f));
-
   const contents = new Map<string, string>();
-  const sources: [string, FoldedSource][] = [];
   const folded = new Map<string, FoldedSource>();
-  for (const f of texish) {
+  for (const f of files.filter((f) => /\.(tex|bib|cls|sty)$/i.test(f))) {
     let content: string;
     try { content = await readTextFile(root, f); } catch { continue; }
     contents.set(f, content);
-    const src = foldSource(content);
-    sources.push([f, src]);
-    folded.set(f, src);
+    folded.set(f, foldSource(content));
   }
-  const hits = locateAllAcross(sources, quote);
+  return { contents, folded };
+}
+
+/**
+ * Find the source file+line whose prose best matches `quote`, or null. With
+ * `ctx`, a quote found in several places is told apart by its page. `root` is
+ * read on each call; pass sources from loadSources to look up many quotes
+ * against one reading of the project (check_comments does, for every comment).
+ */
+export async function findAnchor(
+  root: string | ProjectSources, quote: string, ctx: AnchorContext = {},
+): Promise<Anchor | null> {
+  const project = typeof root === 'string' ? await loadSources(root) : root;
+  if (!project) return null;
+  const hits = locateAllAcross(project.folded, quote);
   if (!hits.length) return null;
-  const hit = hits.length === 1 ? hits[0] : pickHit(hits, folded, fold(quote).text, ctx);
-  const lines = contents.get(hit.key)!.split(/\r?\n/);
+  const hit = hits.length === 1 ? hits[0] : pickHit(hits, project.folded, fold(quote).text, ctx);
+  const lines = project.contents.get(hit.key)!.split(/\r?\n/);
   const snippet = lines.slice(Math.max(0, hit.line - 1), hit.line + 2).join('\n');
   return { file: hit.key, line: hit.line + 1, snippet };
 }

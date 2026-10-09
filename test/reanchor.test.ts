@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  anchorUpdate, contextAt, foldPages, locate, locateOn, pageSignature, type AnchoredComment, type Placement,
+  anchorUpdate, contextAt, foldDoc, foldPages, locate, locateOn, pageSignature, type AnchoredComment, type Placement,
 } from '../src/preview/reanchor.js';
 import { addComment, listComments, reanchorComments } from '../src/preview/commentsStore.js';
 
@@ -27,7 +27,7 @@ const made = (pages: string[], page: number, quote: string): Tracked => {
 };
 /** Re-anchor `c` against `pages` and apply the update, as the store does. */
 const step = (pages: string[], c: Tracked): Tracked => {
-  const u = anchorUpdate(foldPages(pages), pages, c);
+  const u = anchorUpdate(foldDoc(pages), c);
   if (!u) return c;
   const { current, stale, ...rest } = u;
   const next: Tracked = { ...c, ...rest };
@@ -210,17 +210,75 @@ test('pageSignature skips the header every page shares', () => {
 
 test('anchorUpdate: an agent quote that never matched the PDF is left alone', () => {
   const pages = [scope, question];
-  assert.equal(anchorUpdate(foldPages(pages), pages, { page: 1, quote: 'texte réécrit depuis', rects: [] }), null);
+  assert.equal(anchorUpdate(foldDoc(pages), { page: 1, quote: 'texte réécrit depuis', rects: [] }), null);
 });
 
 test('anchorUpdate: context is written down only for a sure placement', () => {
   const pages = [scope, scope, question];
-  const folded = foldPages(pages);
-  const guess = anchorUpdate(folded, pages, { page: 1, quote: 'Une seule variable', rects: [] })!;
+  const doc = foldDoc(pages);
+  const guess = anchorUpdate(doc, { page: 1, quote: 'Une seule variable', rects: [] })!;
   assert.equal(guess.prefix, undefined);
-  const sure = anchorUpdate(folded, pages, { page: 1, quote: 'omp parallel private( i )', rects: [] })!;
+  const sure = anchorUpdate(doc, { page: 1, quote: 'omp parallel private( i )', rects: [] })!;
   assert.equal(sure.page, 3);
   assert.match(sure.prefix!, /programme \?#pragma $/);
+});
+
+test('a passage once rewritten, then lost: what replaced it is no longer claimed', () => {
+  const before = [intro, scope, question];
+  let c = step(before, made(before, 2, 'Une copie par thread'));
+  c = step([intro, slide('Portée des variables', 'Privée Chaque thread a la sienne Partagée Une seule variable, vue de tous'), question], c);
+  assert.equal(c.current, 'Chaque thread a la sienne');
+  // Then the whole slide goes.
+  c = step([intro, slide('Autre', 'rien à voir du tout'), question], c);
+  assert.equal(c.stale, true);
+  assert.equal(c.current, undefined);
+});
+
+test('a page that only moved keeps its signature; one rewritten gets a new one', () => {
+  const extra = slide('Exemple', 'Somme des éléments d’un tableau, chaque thread garde une somme partielle locale.');
+  const before = [intro, scope, extra, question];
+  const c = step(before, made(before, 3, 'Somme des éléments'));
+  assert.ok(c.pageSig?.length);
+  // Moved two pages down, same words: nothing to redo.
+  const moved = anchorUpdate(foldDoc([intro, slide('A', 'a a a a'), slide('B', 'b b b b'), scope, extra, question]), c)!;
+  assert.equal(moved.page, 5);
+  assert.equal(moved.pageSig, undefined);
+  // Same quote, the rest of the slide rewritten: the signature is redone.
+  const redone = anchorUpdate(foldDoc([intro, scope, slide('Exemple', 'Somme des éléments, avec une réduction OpenMP cette fois.'), question]), c)!;
+  assert.ok(redone.pageSig && JSON.stringify(redone.pageSig) !== JSON.stringify(c.pageSig));
+});
+
+test('one comment that cannot be placed does not stop the others', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'ra-'));
+  try {
+    const bad = await addComment(d, { page: 1, quote: 'bad', rects: [], text: 'x' });
+    const good = await addComment(d, { page: 1, quote: 'good', rects: [], text: 'y' });
+    const changed = await reanchorComments(d, (c) => {
+      if (c.id === bad.id) throw new Error('boom');
+      return { page: 3 };
+    });
+    assert.equal(changed, true);
+    const all = await listComments(d);
+    assert.equal(all.find((c) => c.id === bad.id)!.page, 1);
+    assert.equal(all.find((c) => c.id === good.id)!.page, 3);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('a hand-edited comment with no quote or page is normalised, not fatal', async () => {
+  const d = mkdtempSync(join(tmpdir(), 'ra-'));
+  try {
+    await addComment(d, { page: 1, quote: 'q', rects: [], text: 'x' });
+    const file = join(d, '.latex-preview', 'comments.json');
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    raw[0].quote = null;
+    raw[0].page = 'two';
+    writeFileSync(file, JSON.stringify(raw));
+    const [c] = await listComments(d);
+    assert.equal(c.quote, '');
+    assert.equal(c.page, 1);
+    // And re-anchoring it is a no-op (too short to place), not a throw.
+    assert.equal(anchorUpdate(foldDoc([scope]), c), null);
+  } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
 test('reanchorComments writes only what changed, and clears stale and current', async () => {

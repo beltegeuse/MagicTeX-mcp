@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { findAnchor } from '../src/preview/anchorMatch.js';
+import { findAnchor, loadSources } from '../src/preview/anchorMatch.js';
 
 const project = (main: string) => {
   const d = mkdtempSync(join(tmpdir(), 'am-'));
@@ -82,5 +82,17 @@ test('a short quote found in several files is told apart by its page', async () 
     // And the prefix/suffix pick the block title, not the frame title.
     const exact = await findAnchor(d, 'Partagée', { pageText, prefix: 'Une copie par thread', suffix: 'Une seule variable' });
     assert.deepEqual([exact!.file, exact!.line], ['portee.tex', 5]);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('sources read once answer any number of lookups, the same as reading each time', async () => {
+  const d = project('\\documentclass{article}\n\\begin{document}\nThe quick brown fox jumps over the lazy dog here.\nA second sentence about something else entirely.\n\\end{document}\n');
+  try {
+    const sources = await loadSources(d);
+    assert.ok(sources);
+    for (const q of ['quick brown fox jumps over the lazy dog', 'second sentence about something else']) {
+      assert.deepEqual(await findAnchor(sources!, q), await findAnchor(d, q));
+    }
+    assert.equal((await findAnchor(sources!, 'second sentence about something else'))!.line, 4);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });

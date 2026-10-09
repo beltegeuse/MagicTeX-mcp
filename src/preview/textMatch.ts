@@ -231,6 +231,17 @@ export function commonPrefixLength(a: string, b: string): number {
   return n;
 }
 
+/**
+ * How well the text around [start, end) of folded `text` matches a remembered
+ * folded context: letters shared, outwards, with `pre` before and `post` after.
+ * The one formula both the PDF side (reanchor.ts) and the source side
+ * (anchorMatch.ts) tell repeated passages apart by.
+ */
+export function contextScore(text: string, start: number, end: number, pre: string, post: string): number {
+  return commonSuffixLength(pre, text.slice(Math.max(0, start - pre.length), start))
+    + commonPrefixLength(post, text.slice(end, end + post.length));
+}
+
 /** The 0-based line of `content` (a LaTeX file) where `quote` starts, or null. */
 export function locateInSource(content: string, quote: string): number | null {
   return locateAcross([[null, foldSource(content)]], quote)?.line ?? null;
