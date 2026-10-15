@@ -16,6 +16,34 @@ const DEBOUNCE_MS = 400;
 
 let watcher: FSWatcher | null = null;
 let timer: NodeJS.Timeout | null = null;
+// Why live reload stopped, when it did. Set once, and never retried: the walk
+// that failed would fail again on the next render_preview.
+let watchFailure: string | null = null;
+
+/** Why live reload is off, or null while it works. */
+export function watchFailureReason(): string | null {
+  return watchFailure;
+}
+
+/**
+ * Explain a watcher error to someone who did not know a watcher existed.
+ * chokidar watches every directory under the project root, which is the
+ * directory Claude Code was started in — not the folder of the .tex file. Started
+ * from the root of a large repository (build trees, submodules, vendored code),
+ * that is thousands of watches, and the error reaches nobody: an unhandled
+ * 'error' event killed the server, which Claude Code only reported as
+ * "Connection closed".
+ */
+export function describeWatchError(err: unknown, projectRoot: string): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  const raw = err instanceof Error ? err.message : String(err);
+  if (code === 'EMFILE' || code === 'ENFILE' || code === 'ENOSPC') {
+    return `the project root ${projectRoot} holds too many files to watch (${code}: ${raw}). `
+      + 'MagicTeX watches every folder under the directory Claude Code was started in. '
+      + 'Start Claude Code from the folder that holds the LaTeX sources instead.';
+  }
+  return `watching ${projectRoot} failed (${code ? `${code}: ` : ''}${raw}).`;
+}
 
 // Paths the server just wrote itself (built-in editor saves). We skip the change
 // event they cause so an in-app save can choose whether to recompile — external
@@ -30,7 +58,7 @@ export function suppressNextChange(absPath: string): void {
 
 /** Start watching `projectRoot` (idempotent — only the first call takes effect). */
 export function startWatching(projectRoot: string): void {
-  if (watcher) return;
+  if (watcher || watchFailure) return;
   watcher = chokidar.watch(projectRoot, {
     // Function form (v4-safe): prune ignored directories from the walk entirely.
     ignored: (path, stats) => {
@@ -57,6 +85,19 @@ export function startWatching(projectRoot: string): void {
     }, DEBOUNCE_MS);
   };
   watcher.on('add', onChange).on('change', onChange).on('unlink', onChange);
+  // Without a listener, an 'error' event is thrown and takes the whole server
+  // down. Live reload is a convenience: lose it, keep render_preview, and close
+  // the watcher so the handles it holds do not starve the compile as well.
+  watcher.on('error', (err) => {
+    if (watchFailure) return; // a failing walk reports once per directory
+    watchFailure = describeWatchError(err, projectRoot);
+    console.error(`[magictex-mcp] live reload is off: ${watchFailure}`);
+    const failed = watcher;
+    watcher = null;
+    if (timer) clearTimeout(timer);
+    timer = null;
+    failed?.close().catch(() => {});
+  });
 }
 
 export async function stopWatching(): Promise<void> {
@@ -66,6 +107,7 @@ export async function stopWatching(): Promise<void> {
   if (timer) clearTimeout(timer);
   timer = null;
   suppressed.clear();
+  watchFailure = null;
   await watcher?.close();
   watcher = null;
 }

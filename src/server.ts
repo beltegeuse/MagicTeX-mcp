@@ -18,7 +18,7 @@ import { latestPageTexts, reanchorToLatest, settleComments } from './preview/pdf
 import { getPreview, peekPreview, captureDiff, shutdownEngine } from './engine/browserHost.js';
 import { setConfig, requestCompile } from './coordinator.js';
 import { setProjectRoot } from './session.js';
-import { startWatching, stopWatching } from './watch/fileWatcher.js';
+import { startWatching, stopWatching, watchFailureReason } from './watch/fileWatcher.js';
 import { canTrackHistory, historyStatus, listCheckpoints } from './git/checkpoints.js';
 import { type Engine, type Backend } from './project/compileProject.js';
 import { MainFileError } from './project/resolveMainFile.js';
@@ -49,6 +49,8 @@ const hasWorkspace = existsSync(join(PKG_ROOT, 'ui', 'dist', 'index.html'));
 let viewerOpened = false;
 // One-shot: the no-git note is worth saying, once.
 let historyWarned = false;
+// One-shot too: the watcher fails at most once per server.
+let watchWarned = false;
 
 
 server.registerTool(RENDER_PREVIEW_NAME, renderPreviewConfig, async ({ mainFile, engine, backend, shellEscape }) => {
@@ -89,6 +91,13 @@ server.registerTool(RENDER_PREVIEW_NAME, renderPreviewConfig, async ({ mainFile,
           // "install git" answers neither.
           : `MagicTeX couldn't create its history store — ${history.detail ?? 'unknown error'}. git itself is fine.`;
         notes.push(`Change history is off: ${why} Edits aren't being recorded and you can't diff or roll back. Everything else works.`);
+      }
+      // The watcher walks the tree in the background, so its failure can land
+      // after this compile — whichever render_preview comes next says it.
+      const watchFailure = watchFailureReason();
+      if (!watchWarned && watchFailure) {
+        watchWarned = true;
+        notes.push(`Live reload is off: ${watchFailure} Saves no longer refresh the preview on their own; render_preview still recompiles.`);
       }
       // Say it first: this PDF came off a different toolchain than the one the
       // machine is set up for, and that is the single most important thing about
